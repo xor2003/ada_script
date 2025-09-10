@@ -4,18 +4,17 @@ Uses Qiling to emulate the binary, discover code, data, and functions.
 """
 
 import sys
+import logging
 from collections import defaultdict
 from qiling import Qiling
 from qiling.const import QL_ARCH, QL_OS, QL_VERBOSE
 from capstone import *
 from capstone.x86 import *
-from database import AnalysisDatabase, ITEM_TYPE_CODE, ITEM_TYPE_DATA, DATA_TYPE_BYTE, DATA_TYPE_WORD, DATA_TYPE_DWORD
+from database import AnalysisDatabase, ITEM_TYPE_CODE, ITEM_TYPE_DATA, ITEM_TYPE_UNDEFINED, DATA_TYPE_BYTE, DATA_TYPE_WORD, DATA_TYPE_DWORD
+
+logger = logging.getLogger(__name__)
 
 # Suppress noisy Qiling logging
-QL_VERBOSE.DISABLED = 0
-QL_VERBOSE.DEBUG = 1
-QL_VERBOSE.INFO = 2
-QL_VERBOSE.OFF = 3
 
 class EmulationAnalyzer:
     def __init__(self, db: AnalysisDatabase):
@@ -32,7 +31,7 @@ class EmulationAnalyzer:
         """
         Performs emulation-driven analysis to discover the program structure.
         """
-        print("[*] Starting emulation-driven analysis...")
+        logger.info("Starting emulation-driven analysis...")
         
         # Initial static disassembly pass to populate instruction info
         self._initial_disassembly_pass()
@@ -41,24 +40,26 @@ class EmulationAnalyzer:
             self._setup_qiling()
             self._setup_hooks()
             
-            print(f"[*] Emulating from entry point {self.db.entry_point:05X}...")
+            logger.info(f"Emulating from entry point {self.db.entry_point:05X}...")
             self.ql.run(begin=self.db.entry_point, timeout=timeout_ms)
 
         except Exception as e:
-            print(f"[!] Emulation failed: {e}", file=sys.stderr)
+            logger.error(f"Emulation failed: {e}")
+            import traceback
+            logger.error(f"Emulation failure traceback: {traceback.format_exc()}")
         
-        print("[*] Emulation finished. Post-processing results...")
+        logger.info("Emulation finished. Post-processing results...")
         self._post_process_memory_accesses()
         self._discover_functions()
         self._name_unnamed_items()
-        print("[*] Emulation analysis complete.")
+        logger.info("Emulation analysis complete.")
 
     def _setup_qiling(self):
         self.ql = Qiling(
             [],
             archtype=QL_ARCH.X86,
             ostype=QL_OS.DOS,
-            verbose=QL_VERBOSE.OFF
+            verbose=QL_VERBOSE.DEFAULT
         )
         # Map all segments from the database into Qiling's memory
         for seg in self.db.segments:

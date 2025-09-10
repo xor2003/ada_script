@@ -3,7 +3,10 @@ output_generator.py: Generates the final output files (.lst and .asm).
 """
 
 import textwrap
+import logging
 from database import AnalysisDatabase, ITEM_TYPE_CODE, ITEM_TYPE_DATA, DATA_TYPE_ASCII, DATA_TYPE_WORD, DATA_TYPE_DWORD
+
+logger = logging.getLogger(__name__)
 
 class OutputGenerator:
     def __init__(self, db: AnalysisDatabase):
@@ -18,7 +21,7 @@ class OutputGenerator:
 
 class LSTGenerator(OutputGenerator):
     def generate(self, filepath: str):
-        print(f"[*] Generating LST file: {filepath}")
+        logger.info(f"Generating LST file: {filepath}")
         with open(filepath, 'w') as f:
             for seg in sorted(self.db.segments, key=lambda s: s.start_addr):
                 f.write(f"; Segment: {seg.name} ({seg.seg_class}) at {seg.selector:04X}\n;---------------------------------------------------------------------------\n\n")
@@ -71,7 +74,7 @@ class LSTGenerator(OutputGenerator):
 
 class ASMGenerator(OutputGenerator):
     def generate(self, filepath: str):
-        print(f"[*] Generating ASM file: {filepath}")
+        logger.info(f"Generating ASM file: {filepath}")
         with open(filepath, 'w') as f:
             f.write(".MODEL SMALL\n.CODE\n\n")
             assumes = [f"{s.seg_class.lower()}:{s.name}" for s in self.db.segments]
