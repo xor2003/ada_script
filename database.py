@@ -116,3 +116,4 @@ class AnalysisDatabase:
             info = self.get_address_info(start_addr)
             if info and not info.label:
                 info.label = name
+

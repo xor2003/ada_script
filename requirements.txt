@@ -1,4 +1,5 @@
 capstone
 pefile
 lark
-unicorn
+unicorn>=2.0.0
+

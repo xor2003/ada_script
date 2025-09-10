@@ -143,7 +143,6 @@ class IDCTransformer(Transformer):
 class IDCScriptEngine:
     def __init__(self, db: AnalysisDatabase):
         self.db = db
-        self.parser = Lark(idc_grammar, start='start', parser='lalr', transformer=IDCTransformer())
         self.function_map = self._initialize_function_map()
 
     def _initialize_function_map(self):
@@ -154,203 +153,69 @@ class IDCScriptEngine:
             "add_func": self.idc_add_func, "op_hex": lambda a, n: self.idc_op_format(a, n, 'hex'),
             "op_dec": lambda a, n: self.idc_op_format(a, n, 'dec'), "op_offset": self.idc_op_offset,
             "op_plain_offset": self.idc_op_offset, "add_segm_ex": self.idc_add_segm_ex,
-            # --- Comprehensive list of No-Op functions ---
-            "update_extra_cmt": self.idc_no_op, "set_frame_size": self.idc_no_op, "define_local_var": self.idc_no_op,
-            "op_enum": self.idc_no_op, "op_stroff": self.idc_no_op, "op_stkvar": self.idc_no_op,
-            "op_seg": self.idc_no_op, "SegRename": self.idc_no_op, "SegClass": self.idc_no_op,
-            "SegDefReg": self.idc_no_op, "set_segm_type": self.idc_no_op, "split_sreg_range": self.idc_no_op,
-            "delete_all_segments": self.idc_no_op, "add_enum": self.idc_no_op, "add_enum_member": self.idc_no_op,
-            "add_struc": self.idc_no_op, "add_struc_member": self.idc_no_op, "get_struc_id": self.idc_no_op,
-            "get_member_id": self.idc_no_op, "SetType": self.idc_no_op, "set_struc_align": self.idc_no_op,
-            "set_processor_type": self.idc_no_op, "set_inf_attr": self.idc_no_op, "set_flag": self.idc_no_op,
-            "add_default_til": self.idc_no_op, "begin_type_updating": self.idc_no_op, "end_type_updating": self.idc_no_op,
-            "make_array": self.idc_no_op, "get_inf_attr": self.idc_no_op, "GetEnum": self.idc_no_op,
+            **{k: self.idc_no_op for k in ["update_extra_cmt", "set_frame_size", "define_local_var", "op_enum",
+            "op_stroff", "op_stkvar", "op_seg", "SegRename", "SegClass", "SegDefReg", "set_segm_type",
+            "split_sreg_range", "delete_all_segments", "add_enum", "add_enum_member", "add_struc", "add_struc_member",
+            "get_struc_id", "get_member_id", "SetType", "set_struc_align", "set_processor_type", "set_inf_attr",
+            "set_flag", "add_default_til", "begin_type_updating", "end_type_updating", "make_array", "get_inf_attr", "GetEnum"]}
         }
 
-    def idc_no_op(self, *args, **kwargs):
-        return 0 # Return a dummy value for expressions
-
-    def execute_script(self, filepath: str):
-        logger.info(f"Executing IDC script: {filepath}")
-        try:
-            # Check file size first
-            file_size = os.path.getsize(filepath)
-            if file_size > 10000:  # If file is larger than 10KB, process in chunks
-                logger.warning(f"Large IDC file detected ({file_size} bytes). Processing in chunks...")
-                self._process_large_idc_file(filepath)
-                return
-
-            with open(filepath, 'r', encoding='latin-1') as f:
-                content = f.read()
-
-            logger.debug(f"IDC script content (first 100 chars): {content[:100]}")
-
-            # Parse the content and handle any parse errors
-            try:
-                logger.debug("Starting IDC script parsing...")
-                # The transformer is now part of the Lark instance
-                parse_tree = self.parser.parse(content)
-                logger.debug(f"Parse tree type: {type(parse_tree)}")
-
-                # If the result is a list (from the start rule), use it directly
-                if isinstance(parse_tree, list):
-                    statements = parse_tree
-                    logger.debug("Parse tree is a list, using directly")
-                # If it's a Tree object, extract the children
-                elif hasattr(parse_tree, 'children'):
-                    logger.debug("Parse tree has children attribute")
-                    statements = parse_tree.children if parse_tree.children else []
-                else:
-                    # Handle other cases
-                    logger.debug(f"Parse tree is neither list nor has children. Type: {type(parse_tree)}")
-                    statements = [parse_tree] if parse_tree else []
-
-                logger.info(f"Found and parsed {len(statements)} function calls in IDC script.")
-
-                for i, item in enumerate(statements):
-                    logger.debug(f"Processing statement {i+1}: {item}")
-
-                    # Skip if not a tuple or doesn't have expected structure
-                    if not isinstance(item, tuple) or len(item) < 2:
-                        logger.debug(f"Skipping non-tuple or malformed statement: {item}")
-                        continue
-
-                    func_name, args = item
-
-                    if func_name in self.function_map:
-                        # Filter out nested call results from argument lists
-                        clean_args = [arg for arg in args if not isinstance(arg, tuple)]
-                        try:
-                            logger.debug(f"Executing {func_name} with args: {clean_args}")
-                            self.function_map[func_name](*clean_args)
-                        except TypeError:
-                            logger.warning(f"IDC Warning (call {i+1}): Incorrect arguments for '{func_name}'. Have {clean_args}. Skipping.")
-                        except Exception as e:
-                            logger.warning(f"IDC Warning (call {i+1}): Runtime error in '{func_name}': {e}. Skipping.")
-                    else:
-                        logger.debug(f"Function {func_name} not in function map. Available functions: {list(self.function_map.keys())}")
-            except Exception as parse_error:
-                logger.error(f"Error during IDC script parsing: {parse_error}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                raise
-        except Exception as e:
-            logger.error(f"Fatal error parsing IDC script: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-
-    def _process_large_idc_file(self, filepath):
-        """Process a large IDC file in chunks to avoid memory issues."""
-        import os
-        import os
-        import re
-
-        # Simple regex to match function calls like create_byte(0x1234);
-        func_call_pattern = re.compile(r'(\w+)\(([^)]*)\);')
-
-        logger.info(f"Processing large IDC file: {filepath}")
-
-        with open(filepath, 'r', encoding='latin-1') as f:
-            line_number = 0
-            for line in f:
-                line_number += 1
-                # Skip comments and empty lines
-                if line.strip().startswith(('//', '#', '/*')) or not line.strip():
-                    continue
-
-                # Look for function calls in the line
-                for match in func_call_pattern.finditer(line):
-                    func_name = match.group(1)
-                    args_str = match.group(2)
-
-                    # Skip functions we don't handle
-                    if func_name not in self.function_map:
-                        continue
-
-                    # Parse arguments (simple comma-separated values)
-                    args = []
-                    for arg_str in [a.strip() for a in args_str.split(',') if a.strip()]:
-                        # Handle different argument types
-                        if arg_str.startswith(('0x', '0X')):
-                            # Hex number
-                            args.append(int(arg_str, 16))
-                        elif arg_str.isdigit() or (arg_str.startswith('-') and arg_str[1:].isdigit()):
-                            # Decimal number
-                            args.append(int(arg_str))
-                        elif arg_str.startswith('"') and arg_str.endswith('"'):
-                            # String literal
-                            args.append(arg_str[1:-1])
-                        else:
-                            # Assume it's a variable name or other identifier
-                            args.append(arg_str)
-
-                    try:
-                        logger.debug(f"Executing {func_name} with args: {args}")
-                        self.function_map[func_name](*args)
-                    except TypeError:
-                        logger.warning(f"IDC Warning (line {line_number}): Incorrect arguments for '{func_name}'. Have {args}. Skipping.")
-                    except Exception as e:
-                        logger.warning(f"IDC Warning (line {line_number}): Runtime error in '{func_name}': {e}. Skipping.")
-
+    def idc_no_op(self, *args, **kwargs): return 0
     def idc_create_insn(self, addr):
-        info = self.db.get_address_info(addr)
-        if info: info.item_type = ITEM_TYPE_CODE
-
+        if info := self.db.get_address_info(addr): info.item_type = ITEM_TYPE_CODE
     def idc_create_data(self, addr, size):
         for i in range(size):
-            info = self.db.get_address_info(addr + i)
-            if info:
+            if info := self.db.get_address_info(addr + i):
                 info.item_type = ITEM_TYPE_DATA
                 if i == 0:
                     info.item_size = size
                     if size == 4: info.data_type = DATA_TYPE_DWORD
                     elif size == 2: info.data_type = DATA_TYPE_WORD
                     else: info.data_type = DATA_TYPE_BYTE
-
     def idc_create_ascii(self, addr, length):
         if length == 0:
             curr_addr, length = addr, 0
             while True:
-                info = self.db.get_address_info(curr_addr)
-                length += 1
+                info = self.db.get_address_info(curr_addr); length += 1
                 if not info or info.byte_value == 0: break
                 curr_addr += 1
-        
-        info = self.db.get_address_info(addr)
-        if info:
-            info.item_type = ITEM_TYPE_DATA
-            info.item_size = length
-            info.data_type = DATA_TYPE_ASCII
-        
+        if info := self.db.get_address_info(addr):
+            info.item_type, info.item_size, info.data_type = ITEM_TYPE_DATA, length, DATA_TYPE_ASCII
         for i in range(1, length):
-            info_rest = self.db.get_address_info(addr + i)
-            if info_rest:
-                info_rest.item_type = ITEM_TYPE_DATA
-                info_rest.data_type = DATA_TYPE_ASCII
-
-    def idc_set_name(self, addr, name):
-        info = self.db.get_address_info(addr)
-        if info: info.label = name
-
-    def idc_set_cmt(self, addr, comment, repeatable):
-        info = self.db.get_address_info(addr)
-        if info:
-            if repeatable: info.repeatable_comment = comment
+            if info_rest := self.db.get_address_info(addr + i): info_rest.item_type, info_rest.data_type = ITEM_TYPE_DATA, DATA_TYPE_ASCII
+    def idc_set_name(self, addr, name, *args):
+        if info := self.db.get_address_info(addr): info.label = name
+    def idc_set_cmt(self, addr, comment, repeatable=0, *args):
+        is_repeatable = bool(int(repeatable)) if str(repeatable).isdigit() else False
+        if info := self.db.get_address_info(addr):
+            if is_repeatable: info.repeatable_comment = comment
             else: info.comment = comment
-
-    def idc_op_format(self, addr, op_index, fmt_type):
-        self.db.operand_format_overrides[(addr, op_index)] = OperandFormat(format_type=fmt_type)
-
-    def idc_op_offset(self, addr, op_index, base):
-        self.db.operand_format_overrides[(addr, op_index)] = OperandFormat(format_type='offset', value=base)
-
-    def idc_add_func(self, start_addr, end_addr):
-        self.db.add_function(start_addr, end_addr)
-
+    def idc_op_format(self, addr, op_index, fmt_type): self.db.operand_format_overrides[(addr, op_index)] = OperandFormat(fmt_type)
+    def idc_op_offset(self, addr, op_index, base): self.db.operand_format_overrides[(addr, op_index)] = OperandFormat('offset', base)
+    def idc_add_func(self, start_addr, end_addr): self.db.add_function(start_addr, end_addr)
     def idc_add_segm_ex(self, start, end, base, use32, name, sclass, *args):
-        selector = base
-        # Ensure sclass is always a string
-        seg_class_str = str(sclass) if sclass is not None else "CODE"
-        new_seg = Segment(name, start, end, selector, seg_class_str, bool(use32))
-        if not self.db.get_segment_by_selector(selector):
-            self.db.segments.append(new_seg)
+        new_seg = Segment(name, start, end, base, str(sclass) if sclass else "CODE", bool(use32))
+        if not self.db.get_segment_by_selector(base): self.db.segments.append(new_seg)
+
+    def execute_script(self, filepath: str):
+        logger.info(f"Executing IDC script: {filepath}")
+        func_call_pattern = re.compile(r'(\w+)\(([^)]*)\);')
+        try:
+            with open(filepath, 'r', encoding='latin-1') as f:
+                line_num = 0
+                for line in f:
+                    line_num += 1
+                    if line.strip().startswith(('//', '#', '/*')) or not line.strip(): continue
+                    for match in func_call_pattern.finditer(line):
+                        func_name, args_str = match.group(1), match.group(2)
+                        if func_name in self.function_map:
+                            args = []
+                            for arg_str in [a.strip() for a in args_str.split(',') if a.strip()]:
+                                if arg_str.startswith(('0x', '0X')): args.append(int(arg_str, 16))
+                                elif arg_str.isdigit() or (arg_str.startswith('-') and arg_str[1:].isdigit()): args.append(int(arg_str))
+                                elif arg_str.startswith('"') and arg_str.endswith('"'): args.append(arg_str[1:-1])
+                                else: args.append(arg_str)
+                            try: self.function_map[func_name](*args)
+                            except Exception as e: logger.warning(f"IDC Warning (line {line_num}): Error in '{func_name}({args})': {e}")
+        except Exception as e:
+            logger.error(f"Fatal error processing IDC script: {e}")
