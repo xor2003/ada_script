@@ -15,6 +15,7 @@ def load_mz_exe(filepath: str, db: AnalysisDatabase) -> bool:
     and uses relocation info to identify an initial data segment.
     """
     logger.info(f"Loading MZ-EXE file: {filepath}")
+    db.file_format = "MZ"
     try:
         with open(filepath, 'rb') as f:
             data = f.read()
@@ -108,11 +109,47 @@ def load_mz_exe(filepath: str, db: AnalysisDatabase) -> bool:
     if relocated_data_targets:
         min_data = min(relocated_data_targets)
         max_data = max(relocated_data_targets)
-        
-        # Ensure the data segment doesn't overlap with the code segment
+
+        # Check if relocated data is within the code segment
         if min_data < code_seg_end:
-            logger.warning("Relocated data appears to overlap with code segment. Skipping dseg creation.")
+            # Check if all relocated data is within the code segment
+            if max_data < code_seg_end:
+                logger.info("Relocated data is entirely within the code segment. Marking as data within code.")
+                # Mark and name the relocation targets as data variables within the code segment
+                for addr in sorted(list(relocated_data_targets)):
+                    info = db.get_address_info(addr)
+                    if info:
+                        info.item_type = ITEM_TYPE_DATA
+                        info.data_type = DATA_TYPE_WORD
+                        if not info.label:
+                            info.label = f"word_{addr:X}"
+            else:
+                # Some relocated data is outside the code segment
+                logger.warning("Relocated data overlaps with code segment. Creating separate data segment.")
+                # Adjust min_data to start after the code segment
+                min_data = code_seg_end
+
+                dseg_selector = min_data >> 4
+                db.segments.append(Segment(
+                    name="dseg",
+                    start_addr=db.to_linear_address(dseg_selector, 0),
+                    end_addr=max_data + 256,  # Add padding
+                    selector=dseg_selector,
+                    seg_class="DATA"
+                ))
+                logger.info(f"Heuristically created DATA segment 'dseg' at {dseg_selector:04X}")
+
+                # Mark and name the relocation targets as data variables
+                for addr in sorted(list(relocated_data_targets)):
+                    info = db.get_address_info(addr)
+                    if info:
+                        info.item_type = ITEM_TYPE_DATA
+                        info.data_type = DATA_TYPE_WORD
+                        if not info.label:
+                            info.label = f"word_{addr:X}"
         else:
+            # All relocated data is outside the code segment
+            logger.info("Relocated data does not overlap with code segment.")
             dseg_selector = min_data >> 4
             db.segments.append(Segment(
                 name="dseg",

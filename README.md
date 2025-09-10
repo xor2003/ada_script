@@ -20,7 +20,7 @@ The analysis pipeline proceeds in the following order:
 
 ### 2. Layer 2: Dynamic Analyzer (`emulation_analyzer.py`)
 - **Responsibility**: To perform deep, automatic discovery of code, data, and functions by observing the program's behavior. This is the core of the auto-analysis.
-- **Engine**: `qiling` framework (which uses `unicorn` as its CPU core).
+- **Engine**: `unicorn` framework for CPU emulation.
 - **Actions**:
     - Sets up a 16-bit x86 virtual machine.
     - **Executes the code starting from the entry point**.

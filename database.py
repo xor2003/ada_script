@@ -68,6 +68,7 @@ class AnalysisDatabase:
         self.entry_point: int = 0
         self.operand_format_overrides: Dict[Tuple[int, int], OperandFormat] = {} # (addr, op_idx) -> Format
         self.segment_register_assumptions: Dict[int, Dict[str, int]] = collections.defaultdict(dict) # addr -> {'cs': val, 'ds': val}
+        self.file_format: str = "UNKNOWN"
 
     def get_address_info(self, address: int) -> Optional[AddressInfo]:
         """Safely retrieves AddressInfo for a given linear address."""
