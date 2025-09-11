@@ -9,7 +9,7 @@ including C-style expressions, control flow, and function definitions.
 import logging
 import os
 import re
-from lark import Lark, Transformer
+from lark import Lark, Transformer, v_args
 from database import (
     AnalysisDatabase, ITEM_TYPE_CODE, ITEM_TYPE_DATA, DATA_TYPE_ASCII,
     DATA_TYPE_BYTE, DATA_TYPE_WORD, DATA_TYPE_DWORD,
@@ -18,9 +18,6 @@ from database import (
 
 logger = logging.getLogger(__name__)
 
-# A robust grammar based on the provided IDC specification. It can parse
-# C-style expressions, control flow, and function definitions to reliably
-# extract the low-level API calls we need to execute.
 idc_grammar = r"""
     ?start: item*
 
@@ -51,10 +48,10 @@ idc_grammar = r"""
               | expr_statement
 
     expr_statement: expr ";"
-    if_statement: "if" "(" expr ")" statement ["else" statement]
-    for_statement: "for" "(" expr_statement expr_statement expr? ")" statement
-    while_statement: "while" "(" expr ")" statement
-    do_while_statement: "do" statement "while" "(" expr ")" ";"
+    if_statement: "if" "(" expr ")" statement ["else" statement] -> ignore
+    for_statement: "for" "(" expr_statement expr_statement expr? ")" statement -> ignore
+    while_statement: "while" "(" expr ")" statement -> ignore
+    do_while_statement: "do" statement "while" "(" expr ")" ";" -> ignore
     return_statement: "return" [expr] ";" -> ignore
     break_statement: "break" ";" -> ignore
     continue_statement: "continue" ";" -> ignore
@@ -62,9 +59,10 @@ idc_grammar = r"""
     throw_statement: "throw" expr ";" -> ignore
     empty_statement: ";" -> ignore
 
-    ?expr: assign_expr
-    ?assign_expr: ternary_expr ("=" assign_expr)?
-    ?ternary_expr: logical_or_expr ["?" expr ":" ternary_expr]
+    ?expr: assignment | ternary_expr
+    assignment: CNAME "=" expr
+
+    ?ternary_expr: logical_or_expr ("?" expr ":" ternary_expr)*
     ?logical_or_expr: logical_and_expr ("||" logical_and_expr)*
     ?logical_and_expr: bitwise_or_expr ("&&" bitwise_or_expr)*
     ?bitwise_or_expr: bitwise_xor_expr ("|" bitwise_xor_expr)*
@@ -75,7 +73,8 @@ idc_grammar = r"""
     ?shift_expr: additive_expr (("<<" | ">>") additive_expr)*
     ?additive_expr: multiplicative_expr (("+" | "-") multiplicative_expr)*
     ?multiplicative_expr: unary_expr (("*" | "/" | "%") unary_expr)*
-    ?unary_expr: ("!" | "~" | "&")* atom
+    ?unary_expr: (unary_op)* atom
+    unary_op: "!" | "~" | "&" | "-"
 
     ?atom: literal
          | CNAME -> identifier
@@ -89,56 +88,72 @@ idc_grammar = r"""
             | SIGNED_INT -> number
             | ESCAPED_STRING -> string
 
-    HEX_NUMBER: /0[xX][0-9a-fA-F]+/
+    HEX_NUMBER.2: /0[xX][0-9a-fA-F]+/
 
     %import common.CNAME
     %import common.SIGNED_INT
     %import common.ESCAPED_STRING
     %import common.WS
+
     %ignore WS
     %ignore /\/\/[^\n]*/
     %ignore /\/\*(\*(?!\/)|[^*])*\*\//
 """
 
 class IDCTransformer(Transformer):
-    """
-    Transforms the Lark parse tree. It recursively finds all function calls
-    ('call_expr' nodes) and returns them as a flat list, discarding all other
-    structural and expression-related elements.
-    """
     def __init__(self):
+        super().__init__()
         self.statements = []
+        self.variables = {}
 
-    def number(self, n):
-        return int(n, 0)
+    def number(self, n): return int(n[0].value, 0)
+    def string(self, s): return s[0].value[1:-1].encode('latin-1').decode('unicode_escape')
+    def identifier(self, i): return self.variables.get(str(i[0].value), str(i[0].value))
 
-    def string(self, s):
-        return s[1:-1].encode('latin-1').decode('unicode_escape')
+    def assignment(self, items):
+        var_name = str(items[0].value)
+        value = items[2] # items are [var_token, '=', value]
+        self.variables[var_name] = value
+        return value
 
-    def identifier(self, i):
-        return str(i)
+    def _reduce_ops(self, items):
+        val = items[0]
+        for i in range(1, len(items), 2):
+            op = items[i].value
+            right = items[i+1]
+            if not isinstance(val, int) or not isinstance(right, int): continue
+            if op == '+': val += right
+            elif op == '-': val -= right
+            elif op == '*': val *= right
+            elif op == '/': val //= right if right != 0 else 0
+            elif op == '|': val |= right
+            elif op == '&': val &= right
+            elif op == '^': val ^= right
+            elif op == '<<': val <<= right
+            elif op == '>>': val >>= right
+        return val
 
-    def arguments(self, *args):
-        return list(args)
+    additive_expr = multiplicative_expr = bitwise_or_expr = bitwise_xor_expr = bitwise_and_expr = shift_expr = _reduce_ops
 
-    def call_expr(self, func_name, args=None):
-        statement_tuple = (str(func_name), args or [])
-        self.statements.append(statement_tuple)
-        return statement_tuple
+    def unary_expr(self, items):
+        val = items[-1]
+        for op in reversed(items[:-1]):
+            if op.value == '-' and isinstance(val, int): val = -val
+            if op.value == '~' and isinstance(val, int): val = ~val
+        return val
 
-    # Default handler for all other rules: traverse children and collect results.
+    def arguments(self, args): return args
+    
+    def call_expr(self, items):
+        func_name = str(items[0].value)
+        args = items[1] if len(items) > 1 else []
+        self.statements.append((func_name, args))
+        if str(func_name) in ("add_struc", "add_enum", "get_struc_id", "GetEnum"): return -1
+        return 0
+
+    def start(self, items): return self.statements
     def __default__(self, data, children, meta):
-        # This is a simple way to visit all nodes recursively.
-        # We don't need to do anything with the results other than
-        # letting the traversal continue down to the `call_expr` nodes.
-        # Return children if they exist, otherwise return data
-        if children:
-            return children
-        return data
-
-    def start(self, items):
-        # After the entire tree is walked, self.statements will be populated.
-        return self.statements
+        return children[0] if len(children) == 1 else children
 
 class IDCScriptEngine:
     def __init__(self, db: AnalysisDatabase):
@@ -162,8 +177,10 @@ class IDCScriptEngine:
 
     def idc_no_op(self, *args, **kwargs): return 0
     def idc_create_insn(self, addr):
+        if not isinstance(addr, int): return
         if info := self.db.get_address_info(addr): info.item_type = ITEM_TYPE_CODE
     def idc_create_data(self, addr, size):
+        if not isinstance(addr, int): return
         for i in range(size):
             if info := self.db.get_address_info(addr + i):
                 info.item_type = ITEM_TYPE_DATA
@@ -171,8 +188,9 @@ class IDCScriptEngine:
                     info.item_size = size
                     if size == 4: info.data_type = DATA_TYPE_DWORD
                     elif size == 2: info.data_type = DATA_TYPE_WORD
-                    else: info.data_type = DATA_TYPE_BYTE
-    def idc_create_ascii(self, addr, length):
+                    elif size == 1: info.data_type = DATA_TYPE_BYTE
+    def idc_create_ascii(self, addr, length=0):
+        if not isinstance(addr, int): return
         if length == 0:
             curr_addr, length = addr, 0
             while True:
@@ -184,38 +202,47 @@ class IDCScriptEngine:
         for i in range(1, length):
             if info_rest := self.db.get_address_info(addr + i): info_rest.item_type, info_rest.data_type = ITEM_TYPE_DATA, DATA_TYPE_ASCII
     def idc_set_name(self, addr, name, *args):
+        if not isinstance(addr, int): return
         if info := self.db.get_address_info(addr): info.label = name
     def idc_set_cmt(self, addr, comment, repeatable=0, *args):
+        if not isinstance(addr, int): return
         is_repeatable = bool(int(repeatable)) if str(repeatable).isdigit() else False
         if info := self.db.get_address_info(addr):
             if is_repeatable: info.repeatable_comment = comment
             else: info.comment = comment
-    def idc_op_format(self, addr, op_index, fmt_type): self.db.operand_format_overrides[(addr, op_index)] = OperandFormat(fmt_type)
-    def idc_op_offset(self, addr, op_index, base): self.db.operand_format_overrides[(addr, op_index)] = OperandFormat('offset', base)
-    def idc_add_func(self, start_addr, end_addr): self.db.add_function(start_addr, end_addr)
+    def idc_op_format(self, addr, op_index, fmt_type):
+        if not isinstance(addr, int): return
+        self.db.operand_format_overrides[(addr, op_index)] = OperandFormat(fmt_type)
+    def idc_op_offset(self, addr, op_index, base):
+        if not isinstance(addr, int): return
+        self.db.operand_format_overrides[(addr, op_index)] = OperandFormat('offset', base)
+    def idc_add_func(self, start_addr, end_addr):
+        if not isinstance(start_addr, int) or not isinstance(end_addr, int): return
+        self.db.add_function(start_addr, end_addr)
     def idc_add_segm_ex(self, start, end, base, use32, name, sclass, *args):
+        if not all(isinstance(i, int) for i in [start, end, base, use32]): return
         new_seg = Segment(name, start, end, base, str(sclass) if sclass else "CODE", bool(use32))
         if not self.db.get_segment_by_selector(base): self.db.segments.append(new_seg)
 
     def execute_script(self, filepath: str):
         logger.info(f"Executing IDC script: {filepath}")
-        func_call_pattern = re.compile(r'(\w+)\(([^)]*)\);')
         try:
             with open(filepath, 'r', encoding='latin-1') as f:
-                line_num = 0
-                for line in f:
-                    line_num += 1
-                    if line.strip().startswith(('//', '#', '/*')) or not line.strip(): continue
-                    for match in func_call_pattern.finditer(line):
-                        func_name, args_str = match.group(1), match.group(2)
-                        if func_name in self.function_map:
-                            args = []
-                            for arg_str in [a.strip() for a in args_str.split(',') if a.strip()]:
-                                if arg_str.startswith(('0x', '0X')): args.append(int(arg_str, 16))
-                                elif arg_str.isdigit() or (arg_str.startswith('-') and arg_str[1:].isdigit()): args.append(int(arg_str))
-                                elif arg_str.startswith('"') and arg_str.endswith('"'): args.append(arg_str[1:-1])
-                                else: args.append(arg_str)
-                            try: self.function_map[func_name](*args)
-                            except Exception as e: logger.warning(f"IDC Warning (line {line_num}): Error in '{func_name}({args})': {e}")
+                script_content = f.read()
+            
+            script_content = re.sub(r'\b(x|id|mid)=', '', script_content)
+
+            transformer = IDCTransformer()
+            parser = Lark(idc_grammar, start='start', parser='lalr', transformer=transformer)
+            statements = parser.parse(script_content)
+
+            for func_name, args in statements:
+                if func_name in self.function_map:
+                    try:
+                        self.function_map[func_name](*args)
+                    except Exception as e:
+                        logger.warning(
+                            f"IDC Warning: Error executing '{func_name}({', '.join(map(str, args))})': {e}"
+                        )
         except Exception as e:
-            logger.error(f"Fatal error processing IDC script: {e}")
+            logger.error(f"Fatal error processing IDC script '{filepath}': {e}", exc_info=True)
