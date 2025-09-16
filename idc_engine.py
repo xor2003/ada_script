@@ -126,10 +126,15 @@ class IDCScriptEngine:
         if not arg_str:
             return None
             
-        # Handle hex numbers (0x prefix)
+        # Handle hex numbers (0x prefix or h suffix)
         if arg_str.startswith('0x'):
             try:
                 return int(arg_str, 16)
+            except ValueError:
+                pass
+        elif arg_str.endswith('h'):
+            try:
+                return int(arg_str[:-1], 16)
             except ValueError:
                 pass
                 
@@ -141,12 +146,19 @@ class IDCScriptEngine:
         if arg_str.startswith('"') and arg_str.endswith('"'):
             return arg_str[1:-1].encode('latin-1').decode('unicode_escape')
             
+        # Handle character literals
+        if arg_str.startswith("'") and arg_str.endswith("'"):
+            char = arg_str[1:-1]
+            if char == '\\n': return 10
+            if char == '\\t': return 9
+            return ord(char) if char else 0
+            
         # Handle simple expressions (e.g., 0x1000 + 4)
         try:
             return eval(arg_str, {"__builtins__": None}, {})
         except:
-            logger.warning(f"Could not parse argument: {arg_str}")
-            return None
+            # Return raw string for unparseable arguments
+            return arg_str
 
     def execute_script(self, filepath: str):
         logger.info(f"Executing IDC script: {filepath}")
