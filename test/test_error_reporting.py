@@ -16,7 +16,7 @@ class TestIDCErrorReporting(unittest.TestCase):
         self.engine = IDCScriptEngine(self.db_mock)
         
     def test_unparseable_argument(self):
-        """Test that unparseable arguments log warnings"""
+        """Test that unparseable arguments log warnings with line numbers"""
         with patch('idc_engine.logger.warning') as mock_warning:
             test_script = """
             create_insn(0x1000);
@@ -27,7 +27,9 @@ class TestIDCErrorReporting(unittest.TestCase):
                 
             # Verify warning was logged for unparseable argument
             self.assertTrue(mock_warning.called)
-            self.assertIn("Could not parse argument", mock_warning.call_args[0][0])
+            warning_message = mock_warning.call_args[0][0]
+            self.assertIn("Could not parse argument", warning_message)
+            self.assertIn("Line 3", warning_message)  # Line number of the problematic call
 
     def test_valid_script_no_errors(self):
         """Test that valid scripts don't produce error messages"""

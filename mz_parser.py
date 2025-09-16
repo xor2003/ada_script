@@ -5,7 +5,7 @@ Performs initial static analysis on the relocation table.
 
 import struct
 import logging
-from database import AnalysisDatabase, AddressInfo, Segment, ITEM_TYPE_DATA, DATA_TYPE_WORD
+from database import AnalysisDatabase, AddressInfo, Segment
 
 logger = logging.getLogger(__name__)
 

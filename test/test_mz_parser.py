@@ -1,6 +1,6 @@
 import unittest
 import logging
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from mz_parser import load_mz_exe
 from database import AnalysisDatabase
 

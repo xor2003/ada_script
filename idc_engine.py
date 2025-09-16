@@ -6,7 +6,7 @@ import re
 from database import (
     AnalysisDatabase, ITEM_TYPE_CODE, ITEM_TYPE_DATA, DATA_TYPE_ASCII,
     DATA_TYPE_BYTE, DATA_TYPE_WORD, DATA_TYPE_DWORD,
-    Segment, Function, OperandFormat
+    Segment, OperandFormat
 )
 
 logger = logging.getLogger(__name__)
@@ -74,8 +74,10 @@ class IDCScriptEngine:
             curr_addr, length = addr, 0
             while True:
                 info = self.db.get_address_info(curr_addr)
-                if not info or info.byte_value == 0: break
+                if not info: break
+                # Count this byte even if it's null
                 length += 1
+                if info.byte_value == 0: break
                 curr_addr += 1
         if info := self.db.get_address_info(addr):
             info.item_type = ITEM_TYPE_DATA
@@ -164,6 +166,10 @@ class IDCScriptEngine:
             for match in self.func_regex.finditer(script_content):
                 func_name = match.group(1)
                 args_str = match.group(2).strip()
+                start_pos = match.start()
+                
+                # Calculate line number
+                line_num = script_content.count('\n', 0, start_pos) + 1
                 
                 # Skip empty calls
                 if not args_str:
@@ -171,7 +177,14 @@ class IDCScriptEngine:
                 else:
                     # Split arguments while handling quoted strings
                     arg_strs = self.arg_split_regex.split(args_str)
-                    args = [self.parse_argument(a) for a in arg_strs]
+                    args = []
+                    for a in arg_strs:
+                        parsed = self.parse_argument(a)
+                        if parsed is None:
+                            logger.warning(
+                                f"Line {line_num}: Could not parse argument: {a}"
+                            )
+                        args.append(parsed)
                 
                 # Execute the function if it's in our map
                 if func_name in self.function_map:
@@ -179,7 +192,7 @@ class IDCScriptEngine:
                         self.function_map[func_name](*args)
                     except Exception as e:
                         logger.warning(
-                            f"Error executing '{func_name}({', '.join(map(str, args))})': {e}"
+                            f"Line {line_num}: Error executing '{func_name}({', '.join(map(str, args))})': {e}"
                         )
         except Exception as e:
             logger.error(f"Fatal error processing IDC script: {e}", exc_info=True)

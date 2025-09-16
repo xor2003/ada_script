@@ -2,7 +2,6 @@
 output_generator.py: Generates the final output files (.lst and .asm).
 """
 
-import textwrap
 import logging
 from database import AnalysisDatabase, ITEM_TYPE_CODE, ITEM_TYPE_DATA, DATA_TYPE_ASCII, DATA_TYPE_WORD, DATA_TYPE_DWORD
 
