@@ -13,14 +13,18 @@ from emulation_analyzer import EmulationAnalyzer
 from idc_engine import IDCScriptEngine
 from output_generator import LSTGenerator, ASMGenerator
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
+# Configure logging with adjustable level
+def configure_logging(level=logging.INFO):
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler()
+        ]
+    )
+
+# Set default log level
+log_level = logging.INFO
 
 def main():
     parser = argparse.ArgumentParser(
@@ -30,6 +34,7 @@ def main():
     parser.add_argument("executable", help="Path to the DOS MZ-EXE file to disassemble.")
     parser.add_argument("-s", "--script", help="Path to an IDA-compatible .idc script to apply.")
     parser.add_argument("-o", "--output", help="Base name for the output files (e.g., 'my_program').")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -48,13 +53,34 @@ def main():
     output_base = args.output or os.path.splitext(os.path.basename(args.executable))[0]
     output_asm, output_lst = f"{output_base}.asm", f"{output_base}.lst"
 
-    logging.info("--- Advanced Non-Interactive Disassembler ---")
+    # Configure logging with adjustable level
+    log_level = logging.INFO
+    if "--debug" in sys.argv:
+        log_level = logging.DEBUG
+        sys.argv.remove("--debug")
+    
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler()
+        ]
+    )
+    
+    logger = logging.getLogger(__name__)
+    logger.info("--- Advanced Non-Interactive Disassembler ---")
     
     # 1. Initialize
     db = AnalysisDatabase()
+    logger.debug(f"Database initialized: {db}")
 
     # 2. Static Loader
-    if not load_mz_exe(args.executable, db):
+    try:
+        if not load_mz_exe(args.executable, db):
+            logger.error("Failed to load MZ executable")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Error loading executable: {str(e)}")
         sys.exit(1)
 
     # 3. Dynamic Analyzer (The core of auto-analysis)
@@ -64,7 +90,11 @@ def main():
     # 4. User Override Script
     if args.script:
         idc_engine = IDCScriptEngine(db)
-        idc_engine.execute_script(args.script)
+        try:
+            idc_engine.execute_script(args.script)
+        except Exception as e:
+            logging.error(f"IDC script execution failed: {str(e)}")
+            sys.exit(1)
     
     # 5. Output Generation
     LSTGenerator(db).generate(output_lst)
