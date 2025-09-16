@@ -54,20 +54,21 @@ def main():
     output_asm, output_lst = f"{output_base}.asm", f"{output_base}.lst"
 
     # Configure logging with adjustable level
-    log_level = logging.INFO
-    if "--debug" in sys.argv:
-        log_level = logging.DEBUG
-        sys.argv.remove("--debug")
+    # Configure logging
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logger = logging.getLogger("ada")
+    logger.setLevel(log_level)
     
-    logging.basicConfig(
-        level=log_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler()
-        ]
-    )
+    # Create a handler and formatter
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
     
-    logger = logging.getLogger(__name__)
+    # Add the handler to the logger if it doesn't have one already
+    if not logger.handlers:
+        logger.addHandler(handler)
+    
+    logger.propagate = False
     logger.info("--- Advanced Non-Interactive Disassembler ---")
     
     # 1. Initialize
@@ -100,7 +101,8 @@ def main():
     LSTGenerator(db).generate(output_lst)
     ASMGenerator(db).generate(output_asm)
 
-    logging.info("--- Disassembly Complete ---")
+    # Output completion message to stderr for CLI tests
+    print("Disassembly Complete", file=sys.stderr)
     logging.info(f"Output files generated:\n    - {output_asm}\n    - {output_lst}")
 
 if __name__ == "__main__":
