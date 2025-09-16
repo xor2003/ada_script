@@ -2,7 +2,7 @@
 import logging
 import os
 import re
-from lark import Lark, Transformer, v_args
+from lark import Lark, Transformer, v_args, Token, Tree
 from database import (
     AnalysisDatabase, ITEM_TYPE_CODE, ITEM_TYPE_DATA, DATA_TYPE_ASCII,
     DATA_TYPE_BYTE, DATA_TYPE_WORD, DATA_TYPE_DWORD,
