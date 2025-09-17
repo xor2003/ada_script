@@ -2,6 +2,7 @@
 import logging
 import os
 import re
+import traceback
 from lark import Lark, Transformer, v_args, Token, Tree
 from database import (
     AnalysisDatabase, ITEM_TYPE_CODE, ITEM_TYPE_DATA, DATA_TYPE_ASCII,
@@ -327,7 +328,7 @@ class IDCScriptEngine:
                     else:
                         logger.warning(f"IDC Warning: Unknown function {func_name}")
         except Exception as e:
-            logger.error(f"Error executing IDC script: {e}")
+            logger.error(f"Error executing IDC script: {e}\n{traceback.format_exc()}")
 
     def execute_script(self, filepath: str):
         logger.info(f"Executing IDC script: {filepath}")
