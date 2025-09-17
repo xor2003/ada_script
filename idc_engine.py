@@ -73,11 +73,13 @@ idc_grammar = r"""
 
     ?atom: literal
          | CNAME -> identifier
-         | "(" expr ")"
+         | "(" expr ")" -> paren_expr  # Explicit rule for recursion
          | call_expr
 
     call_expr: CNAME "(" [arguments] ")"
     arguments: (expr ("," expr)*)?
+
+    paren_expr: "(" expr ")"
 
     ?literal: HEX_NUMBER -> number
             | SIGNED_INT -> number
@@ -318,18 +320,29 @@ class IDCScriptEngine:
             if not isinstance(statements, list):
                 statements = [statements] if statements is not None else []
             for stmt in statements:
-                if isinstance(stmt, tuple) and len(stmt) > 1 and stmt[0] == "call":
-                    _, func_name, args = stmt
-                    if func_name in self.function_map:
-                        try:
-                            self.function_map[func_name](*args)
-                        except Exception as e:
-                            logger.error(f"Error in IDC function {func_name}: {e}")
+                try:
+                    if isinstance(stmt, tuple) and len(stmt) > 1 and stmt[0] == "call":
+                        _, func_name, args = stmt
+                        if func_name in self.function_map:
+                            self.function_map[func_name](*[self._evaluate_arg(arg) for arg in args])
+                        else:
+                            logger.warning(f"IDC Warning: Unknown function {func_name}")
+                except Exception as stmt_error:
+                    logger.error(f"Error processing statement: {stmt_error}")
+                    if hasattr(stmt, 'pretty'):
+                        logger.debug(f"Failed node: {stmt.pretty()}")
                     else:
-                        logger.warning(f"IDC Warning: Unknown function {func_name}")
+                        logger.debug(f"Failed node: {str(stmt)}")
+            # After processing all statements, handle any pending variable evaluations if needed
         except Exception as e:
             logger.error(f"Error executing IDC script: {e}\n{traceback.format_exc()}")
 
+    def _evaluate_arg(self, arg):
+        """Helper to evaluate a single argument (handles Tree or Token)."""
+        if isinstance(arg, Tree):
+            return self.transformer.visit(arg) if hasattr(self, 'transformer') else arg
+        return arg
+ 
     def execute_script(self, filepath: str):
         logger.info(f"Executing IDC script: {filepath}")
         try:
