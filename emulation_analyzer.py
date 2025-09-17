@@ -95,6 +95,7 @@ class EmulationAnalyzer:
 
     def _mem_access_hook(self, uc, access, address, size, value, user_data): self.mem_access_log[address].add(size)
     def _initial_disassembly_pass(self):
+        disasm_hits = 0
         for addr, info in self.db.memory.items():
             if info.item_type != ITEM_TYPE_DATA and not info.instruction:
                 code_bytes = bytes([self.db.memory[a].byte_value for a in range(addr, addr + 15) if a in self.db.memory])
@@ -103,22 +104,41 @@ class EmulationAnalyzer:
                     info.instruction, info.item_size, info.item_type = insn, insn.size, ITEM_TYPE_CODE
                     for i in range(1, insn.size):
                         if self.db.get_address_info(addr + i): self.db.get_address_info(addr + i).item_type = ITEM_TYPE_CODE
+                    disasm_hits += 1
+                    if disasm_hits % 10000 == 0:
+                        logger.debug(f"Initial disasm: {disasm_hits} instructions found so far")
                 except StopIteration: pass
+        logger.debug(f"Initial disassembly pass: {disasm_hits} instructions identified")
 
     def _post_process_memory_accesses(self):
+        data_items = 0
+        dword_count, word_count, byte_count = 0, 0, 0
         for addr, sizes in self.mem_access_log.items():
             info = self.db.get_address_info(addr)
             if info and info.item_type != ITEM_TYPE_CODE:
                 info.item_type = ITEM_TYPE_DATA
                 max_size = max(sizes) if sizes else 1
-                if max_size == 4: info.data_type, info.item_size = DATA_TYPE_DWORD, 4
-                elif max_size == 2: info.data_type, info.item_size = DATA_TYPE_WORD, 2
-                else: info.data_type, info.item_size = DATA_TYPE_BYTE, 1
+                if max_size == 4:
+                    info.data_type, info.item_size = DATA_TYPE_DWORD, 4
+                    dword_count += 1
+                elif max_size == 2:
+                    info.data_type, info.item_size = DATA_TYPE_WORD, 2
+                    word_count += 1
+                else:
+                    info.data_type, info.item_size = DATA_TYPE_BYTE, 1
+                    byte_count += 1
+                data_items += 1
+        logger.debug(f"Post-process: {data_items} data items classified ({dword_count} DWORD, {word_count} WORD, {byte_count} BYTE); {len(self.mem_access_log)} access sites")
 
     def _discover_functions(self):
+        functions_discovered = 0
         for start_addr in sorted(list(self.call_targets)):
             end_addr = self._trace_function_end(start_addr)
-            if end_addr > start_addr: self.db.add_function(start_addr, end_addr)
+            if end_addr > start_addr:
+                self.db.add_function(start_addr, end_addr)
+                functions_discovered += 1
+                logger.debug(f"Discovered function at {start_addr:05X} to {end_addr:05X}")
+        logger.debug(f"Function discovery: {functions_discovered} functions added; {len(self.call_targets)} call targets processed")
 
     def _trace_function_end(self, start_addr):
         addr, visited, max_size = start_addr, {start_addr}, 8192
@@ -137,13 +157,19 @@ class EmulationAnalyzer:
         return start_addr + max_size
 
     def _name_unnamed_items(self):
+        unnamed_data = 0
+        unnamed_unk = 0
         for addr, info in self.db.memory.items():
             if not info.label:
                 if info.item_type == ITEM_TYPE_DATA:
                     if info.data_type == DATA_TYPE_DWORD: info.label = f"dword_{addr:X}"
                     elif info.data_type == DATA_TYPE_WORD: info.label = f"word_{addr:X}"
                     else: info.label = f"byte_{addr:X}"
-                elif info.item_type == ITEM_TYPE_UNDEFINED: info.label = f"unk_{addr:X}"
+                    unnamed_data += 1
+                elif info.item_type == ITEM_TYPE_UNDEFINED:
+                    info.label = f"unk_{addr:X}"
+                    unnamed_unk += 1
+        logger.debug(f"Naming: {unnamed_data} data items, {unnamed_unk} undefined items labeled")
 
     def _get_uc_reg_id(self, reg_name):
         reg_map = { "ax": UC_X86_REG_AX, "bx": UC_X86_REG_BX, "cx": UC_X86_REG_CX, "dx": UC_X86_REG_DX, "sp": UC_X86_REG_SP, "bp": UC_X86_REG_BP, "si": UC_X86_REG_SI, "di": UC_X86_REG_DI, "ip": UC_X86_REG_IP, "cs": UC_X86_REG_CS, "ds": UC_X86_REG_DS, "es": UC_X86_REG_ES, "ss": UC_X86_REG_SS }

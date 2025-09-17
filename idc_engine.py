@@ -148,6 +148,7 @@ class IDCTransformer(Transformer):
             var_name = self.safe_extract_value(items[0])
             value = items[2]
             self.variables[var_name] = value
+            logger.debug(f"IDC variable assignment: {var_name} = {value}")
             return value
         else:
             # Handle ternary assignment: [value]
@@ -319,21 +320,31 @@ class IDCScriptEngine:
             statements = parser.parse(script)
             if not isinstance(statements, list):
                 statements = [statements] if statements is not None else []
+            logger.debug(f"IDC script: Processing {len(statements)} statements")
+            processed = 0
             for stmt in statements:
                 try:
+                    processed += 1
+                    if processed % 10 == 0:
+                        logger.debug(f"Processed {processed}/{len(statements)} statements")
                     if isinstance(stmt, tuple) and len(stmt) > 1 and stmt[0] == "call":
                         _, func_name, args = stmt
+                        eval_args = [self._evaluate_arg(arg) for arg in args]
+                        logger.debug(f"Calling IDC function '{func_name}' with args: {eval_args}")
                         if func_name in self.function_map:
-                            self.function_map[func_name](*[self._evaluate_arg(arg) for arg in args])
+                            self.function_map[func_name](*eval_args)
                         else:
                             logger.warning(f"IDC Warning: Unknown function {func_name}")
+                    elif isinstance(stmt, tuple) and stmt[0] == 'assignment':
+                        # Handle assignment from transformer
+                        pass  # Logged in transformer
                 except Exception as stmt_error:
-                    logger.error(f"Error processing statement: {stmt_error}")
+                    logger.error(f"Error processing statement {processed}: {stmt_error}")
                     if hasattr(stmt, 'pretty'):
                         logger.debug(f"Failed node: {stmt.pretty()}")
                     else:
                         logger.debug(f"Failed node: {str(stmt)}")
-            # After processing all statements, handle any pending variable evaluations if needed
+            logger.debug(f"IDC script execution complete: {processed} statements processed")
         except Exception as e:
             logger.error(f"Error executing IDC script: {e}\n{traceback.format_exc()}")
 

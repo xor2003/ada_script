@@ -21,8 +21,10 @@ class OutputGenerator:
 class LSTGenerator(OutputGenerator):
     def generate(self, filepath: str):
         logger.info(f"Generating LST file: {filepath}")
+        code_count, data_count = 0, 0
         with open(filepath, 'w') as f:
             for seg in sorted(self.db.segments, key=lambda s: s.start_addr):
+                logger.debug(f"Processing LST segment '{seg.name}' ({seg.start_addr:05X}-{seg.end_addr:05X})")
                 f.write(f"; Segment: {seg.name} ({seg.seg_class}) at {seg.selector:04X}\n;---------------------------------------------------------------------------\n\n")
                 addr = seg.start_addr
                 while addr < seg.end_addr:
@@ -32,11 +34,16 @@ class LSTGenerator(OutputGenerator):
                         continue
                     if info.repeatable_comment: f.write(f"\n; {info.repeatable_comment}\n")
                     if info.label: f.write(f"{self._format_address(addr)} {' ' * 10}{info.label}:\n")
-                    if info.item_type == ITEM_TYPE_CODE and info.instruction: line = self._format_code_line(info)
-                    elif info.item_type == ITEM_TYPE_DATA: line = self._format_data_line(info)
+                    if info.item_type == ITEM_TYPE_CODE and info.instruction:
+                        line = self._format_code_line(info)
+                        code_count += 1
+                    elif info.item_type == ITEM_TYPE_DATA:
+                        line = self._format_data_line(info)
+                        data_count += 1
                     else: line = self._format_undefined_line(info)
                     f.write(line)
                     addr += info.item_size
+        logger.debug(f"LST generation: {code_count} code lines, {data_count} data lines, {len(self.db.segments)} segments")
 
     def _format_code_line(self, info):
         addr_str, insn = self._format_address(info.address), info.instruction

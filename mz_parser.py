@@ -37,6 +37,8 @@ def load_mz_exe(filepath: str, db: AnalysisDatabase) -> bool:
     e_cs = struct.unpack('<H', data[22:24])[0]
     e_lfarlc = struct.unpack('<H', data[24:26])[0]
     
+    logger.debug(f"MZ Header: Bytes in last page={e_cblp}, Pages={e_cp}, Relocs={e_crlc}, Header paras={e_cparhdr}, Reloc offset={e_lfarlc:04X}")
+    
     header_size = e_cparhdr * 16
     
     if e_cblp == 0:
@@ -71,6 +73,7 @@ def load_mz_exe(filepath: str, db: AnalysisDatabase) -> bool:
     logger.info(f"Created initial CODE segment 'cseg' at {load_segment_base:04X}")
 
     image_data = data[header_size:header_size+load_module_size]
+    logger.debug(f"Loading {len(image_data)} bytes into memory at {code_seg_start:05X}")
     for i, byte in enumerate(image_data):
         addr = code_seg_start + i
         db.memory[addr] = AddressInfo(address=addr, byte_value=byte)
@@ -80,6 +83,7 @@ def load_mz_exe(filepath: str, db: AnalysisDatabase) -> bool:
         logger.info(f"Processing {e_crlc} relocation entries...")
         reloc_table = data[e_lfarlc:e_lfarlc + e_crlc*4]
         
+        processed_relocs = 0
         for i in range(e_crlc):
             offset = i*4
             reloc_offset = struct.unpack('<H', reloc_table[offset:offset+2])[0]
@@ -100,8 +104,12 @@ def load_mz_exe(filepath: str, db: AnalysisDatabase) -> bool:
                 db.memory[reloc_addr_in_mem + 1].relocation = True
                 data_target_addr = db.to_linear_address(new_val, 0)
                 relocated_data_targets.add(data_target_addr)
+                if i % 50 == 0:  # Sample every 50 for large files
+                    logger.debug(f"Processed reloc #{i}: offset={reloc_offset:04X}, target={data_target_addr:05X}")
+                processed_relocs += 1
             else:
                 logger.warning(f"Relocation address {reloc_addr_in_mem:05X} is out of bounds.")
+        logger.debug(f"Applied {processed_relocs}/{e_crlc} relocations; {len(relocated_data_targets)} unique data targets")
 
     if relocated_data_targets:
         min_data = min(relocated_data_targets)
