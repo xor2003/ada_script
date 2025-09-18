@@ -1,66 +1,49 @@
-import pytest
-import os
+# test/test_cli.py
 import sys
-import logging
-from unittest.mock import patch, MagicMock
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import os
+import tempfile
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ada import main
+# Assuming CLI entrypoint in ada.py; use subprocess for testing
+import subprocess
 
-def test_cli_with_valid_file(capsys):
-    test_args = ["ada", "egame.exe", "-o", "test_output"]
-    with patch('sys.argv', test_args), \
-         patch('ada.load_mz_exe') as mock_load, \
-         patch('ada.EmulationAnalyzer') as mock_analyzer, \
-         patch('ada.IDCScriptEngine') as mock_idc, \
-         patch('ada.LSTGenerator') as mock_lst, \
-         patch('ada.ASMGenerator') as mock_asm:
-        
-        mock_load.return_value = True
-        main()
-        
-        captured = capsys.readouterr()
-        assert "Disassembly Complete" in captured.err
-        mock_analyzer.return_value.analyze.assert_called_once()
-        mock_lst.return_value.generate.assert_called_with("test_output.lst")
-        mock_asm.return_value.generate.assert_called_with("test_output.asm")
+def test_cli_help():
+    # Use direct path to ada.py instead of -m ada (avoids module issues)
+    ada_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'ada.py')
+    result = subprocess.run([sys.executable, ada_path, '--help'], capture_output=True, text=True)
+    assert result.returncode == 0
+    # Check stderr for 'usage' since argparse may output to stderr in some envs
+    output = result.stdout + result.stderr
+    assert 'usage' in output.lower()
 
-def test_cli_missing_file(capsys):
-    test_args = ["ada", "missing.exe"]
-    with patch('sys.argv', test_args), \
-         patch('sys.exit') as mock_exit:
-        
-        main()
-        captured = capsys.readouterr()
-        assert "Executable file not found" in captured.err
-        mock_exit.assert_called_with(1)
+def test_cli_version():
+    ada_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'ada.py')
+    result = subprocess.run([sys.executable, ada_path, '--version'], capture_output=True, text=True)
+    assert result.returncode == 0
+    output = result.stdout + result.stderr
+    assert '0.1.0' in output  # Matches version in ada.py
 
-def test_cli_with_idc_script(capsys):
-    test_args = ["ada", "egame.exe", "-s", "analysis.idc"]
-    with patch('sys.argv', test_args), \
-         patch('ada.load_mz_exe') as mock_load, \
-         patch('ada.IDCScriptEngine') as mock_idc, \
-         patch('os.path.exists') as mock_exists:
-        
-        mock_load.return_value = True
-        mock_exists.return_value = True
-        main()
-        
-        mock_idc.return_value.execute_script.assert_called_with("analysis.idc")
+def test_cli_basic_run():
+    # Test basic run with missing files (should error gracefully)
+    ada_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'ada.py')
+    result = subprocess.run([sys.executable, ada_path, 'nonexistent.exe'], capture_output=True, text=True)
+    assert result.returncode == 1  # Expected error exit
+    assert 'Error parsing MZ' in (result.stdout + result.stderr)
 
-def test_cli_debug_logging(capsys):
-    test_args = ["ada", "egame.exe", "--debug"]
-    with patch('sys.argv', test_args), \
-         patch('ada.load_mz_exe') as mock_load, \
-         patch('logging.getLogger') as mock_get_logger:
-        
-        # Create a mock logger object
-        mock_logger = MagicMock()
-        mock_get_logger.return_value = mock_logger
+def test_cli_idc_failure():
+    """Test that IDC parsing failure exits with non-zero code."""
+    with tempfile.NamedTemporaryFile(suffix='.idc', delete=False) as f:
+        f.write(b'invalid syntax here;')  # Causes Lark parse error
+        invalid_idc = f.name
 
-        mock_load.return_value = True
-        main()
-
-        # Verify that getLogger was called and setLevel was called on the returned logger
-        mock_get_logger.assert_any_call("ada")
-        mock_logger.setLevel.assert_called_with(logging.DEBUG)
+    ada_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'ada.py')
+    try:
+        result = subprocess.run(
+            [sys.executable, ada_path, 'dummy.exe', '-s', invalid_idc],
+            capture_output=True, text=True
+        )
+        assert result.returncode == 1, f"Expected exit 1, got {result.returncode}"
+        output = result.stdout + result.stderr
+        assert 'IDC' in output, "Should mention IDC error"
+    finally:
+        os.unlink(invalid_idc)

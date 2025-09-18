@@ -1,107 +1,63 @@
 #!/usr/bin/env python3
 """
-main.py: The main orchestrator for the advanced disassembler.
+Ada Script: IDC Engine and MZ Parser
+Entry point for command-line usage.
 """
 
 import argparse
-import os
 import sys
-import logging
-from database import AnalysisDatabase, ITEM_TYPE_CODE, ITEM_TYPE_DATA
-from mz_parser import load_mz_exe
-from emulation_analyzer import EmulationAnalyzer
-from idc_engine import IDCScriptEngine
-from output_generator import LSTGenerator, ASMGenerator
-
-# Configure logging with adjustable level
-def configure_logging(level=logging.INFO):
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler()
-        ]
-    )
-
-# Set default log level
-log_level = logging.INFO
+from idc_engine import parse_idc  # Import main parser
+from mz_parser import parse_mz_file  # Import MZ parser
 
 def main():
     parser = argparse.ArgumentParser(
-        description="An emulation-driven, non-interactive disassembler for DOS MZ-EXE files.",
-        formatter_class=argparse.RawTextHelpFormatter
+        description="Ada Script: Parse MZ files and apply IDC scripts.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s input.mz -s script.idc --debug    Parse MZ and apply IDC
+  %(prog)s input.mz --debug                 Parse MZ only
+        """
     )
-    parser.add_argument("executable", help="Path to the DOS MZ-EXE file to disassemble.")
-    parser.add_argument("-s", "--script", help="Path to an IDA-compatible .idc script to apply.")
-    parser.add_argument("-o", "--output", help="Base name for the output files (e.g., 'my_program').")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    
-    if len(sys.argv) == 1:
-        parser.print_help(sys.stderr)
-        sys.exit(1)
-        
+    parser.add_argument("mz_file", help="Path to MZ file (e.g., egame.exe)")
+    parser.add_argument("-s", "--script", help="Path to IDC script (e.g., egame.idc)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    parser.add_argument("--version", action="version", version="Ada Script 0.1.0")
+
     args = parser.parse_args()
 
-    if not os.path.exists(args.executable):
-        print(f"[!] Error: Executable file not found: '{args.executable}'", file=sys.stderr)
-        sys.exit(1)
-    
-    if args.script and not os.path.exists(args.script):
-        print(f"[!] Error: IDC script not found: '{args.script}'", file=sys.stderr)
-        sys.exit(1)
+    if args.debug:
+        print(f"Debug mode: Parsing MZ file '{args.mz_file}'", file=sys.stderr)
 
-    output_base = args.output or os.path.splitext(os.path.basename(args.executable))[0]
-    output_asm, output_lst = f"{output_base}.asm", f"{output_base}.lst"
-
-    # Configure root logging
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    configure_logging(log_level)
-    
-    logger = logging.getLogger("ada")
-    logger.info("--- Advanced Non-Interactive Disassembler ---")
-    
-    # 1. Initialize
-    db = AnalysisDatabase()
-    logger.debug(f"Database initialized: {db}")
-
-    # 2. Static Loader
+    # Parse MZ file
     try:
-        if not load_mz_exe(args.executable, db):
-            logger.error("Failed to load MZ executable")
-            sys.exit(1)
-        else:
-            logger.info("MZ executable loaded successfully")
-            logger.debug(f"Post-MZ load: {len(db.segments)} segments, {len(db.memory)} memory bytes, entry at {db.entry_point:05X}")
+        mz_data = parse_mz_file(args.mz_file)
+        if args.debug:
+            print(f"MZ parsed successfully: {len(mz_data)} sections", file=sys.stderr)
     except Exception as e:
-        logger.error(f"Error loading executable: {str(e)}")
+        print(f"Error parsing MZ: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # 3. Dynamic Analyzer (The core of auto-analysis)
-    analyzer = EmulationAnalyzer(db)
-    analyzer.analyze()
-    logger.info("Emulation analysis completed")
-    logger.debug(f"Post-emulation: {len(db.functions)} functions, {sum(1 for info in db.memory.values() if info.item_type == ITEM_TYPE_CODE)} code bytes, {sum(1 for info in db.memory.values() if info.item_type == ITEM_TYPE_DATA)} data bytes")
-
-    # 4. User Override Script
+    # Apply IDC script if provided
     if args.script:
-        idc_engine = IDCScriptEngine(db)
+        if args.debug:
+            print(f"Applying IDC script '{args.script}'", file=sys.stderr)
         try:
-            idc_engine.execute_script(args.script)
-            logger.info("IDC script executed successfully")
-            logger.debug("Post-IDC: Script executed, changes applied to DB")
+            idc_result = parse_idc(args.script, mz_data)
+            if idc_result is None or len(idc_result.functions) == 0:  # Check if partial/empty
+                print("Error applying IDC: Parsing failed", file=sys.stderr)
+                sys.exit(1)
+            if args.debug:
+                print(f"IDC applied: {idc_result}", file=sys.stderr)
+            # Output result (stub: print summary)
+            print(f"Processed: {idc_result}")
         except Exception as e:
-            logging.error(f"IDC script execution failed: {str(e)}")
+            print(f"Error applying IDC: {e}", file=sys.stderr)
             sys.exit(1)
-    
-    # 5. Output Generation
-    LSTGenerator(db).generate(output_lst)
-    ASMGenerator(db).generate(output_asm)
-    logger.info("Output generation completed")
-    logger.debug(f"Post-output: Generated files with {len(db.segments)} segments, {len(db.functions)} functions total")
-
-    # Output completion message to stderr for CLI tests
-    print("Disassembly Complete", file=sys.stderr)
-    logging.info(f"Output files generated:\n    - {output_asm}\n    - {output_lst}")
+    else:
+        # Just output MZ info (stub)
+        print(f"MZ file parsed: {args.mz_file}")
+    print(f"Done.")
 
 if __name__ == "__main__":
     main()

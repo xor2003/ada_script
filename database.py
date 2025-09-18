@@ -70,8 +70,15 @@ class AnalysisDatabase:
         self.segment_register_assumptions: Dict[int, Dict[str, int]] = collections.defaultdict(dict) # addr -> {'cs': val, 'ds': val}
         self.file_format: str = "UNKNOWN"
 
+    def add_function(self, start_addr, end_addr, name=None):
+        """Adds a function to the database with an optional name."""
+        func_name = name or f"sub_{start_addr:04X}"
+        self.functions[start_addr] = Function(start_addr, end_addr, func_name)
+
     def get_address_info(self, address: int) -> Optional[AddressInfo]:
         """Safely retrieves AddressInfo for a given linear address."""
+        if address not in self.memory:
+            self.memory[address] = AddressInfo(address, 0)
         return self.memory.get(address)
 
     def get_label_at(self, address: int) -> Optional[str]:
@@ -97,6 +104,10 @@ class AnalysisDatabase:
                 return seg
         return None
 
+    def get_function_at(self, address: int) -> Optional[Function]:
+        """Finds the function that starts at the given address."""
+        return self.functions.get(address)
+
     def get_function_containing(self, address: int) -> Optional[Function]:
         """Finds the function that contains the given address."""
         for func in self.functions.values():
@@ -117,3 +128,26 @@ class AnalysisDatabase:
             if info and not info.label:
                 info.label = name
 
+    def set_label(self, addr: int, label: str):
+        """Set label at address."""
+        info = self.get_address_info(addr)
+        if info:
+            info.label = label
+
+    def set_item_type(self, addr: int, item_type: str):
+        """Set item type at address."""
+        info = self.get_address_info(addr)
+        if info:
+            info.item_type = item_type
+
+    def set_data_type(self, addr: int, data_type: int):
+        """Set data type at address."""
+        info = self.get_address_info(addr)
+        if info:
+            info.data_type = data_type
+
+    def set_item_size(self, addr: int, size: int):
+        """Set item size at address."""
+        info = self.get_address_info(addr)
+        if info:
+            info.item_size = size
