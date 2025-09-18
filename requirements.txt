@@ -2,7 +2,4 @@ capstone
 pefile
 lark
 unicorn>=2.0.0
-
-
 pytest
-lark-parser
