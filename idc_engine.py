@@ -364,8 +364,9 @@ class IDCTransformer(Transformer):
         return None  # Ignore
 
 class IDCScriptEngine:
-    def __init__(self, db):
+    def __init__(self, db, strict=False):
         self.db = db
+        self.strict = strict
         self.transformer = IDCTransformer()
         self.handlers = {
             'add_func': self._handle_add_func,

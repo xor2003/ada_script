@@ -43,7 +43,7 @@ Examples:
         if args.debug:
             print(f"Applying IDC script '{args.script}'", file=sys.stderr)
         try:
-            idc_result = parse_idc(args.script, mz_data)
+            idc_result = parse_idc(args.script, mz_data, strict=True)
             if idc_result is None or len(idc_result.functions) == 0:  # Check if partial/empty
                 print("Error applying IDC: Parsing failed", file=sys.stderr)
                 sys.exit(1)
