@@ -70,11 +70,6 @@ class AnalysisDatabase:
         self.segment_register_assumptions: Dict[int, Dict[str, int]] = collections.defaultdict(dict) # addr -> {'cs': val, 'ds': val}
         self.file_format: str = "UNKNOWN"
 
-    def add_function(self, start_addr, end_addr, name=None):
-        """Adds a function to the database with an optional name."""
-        func_name = name or f"sub_{start_addr:04X}"
-        self.functions[start_addr] = Function(start_addr, end_addr, func_name)
-
     def get_address_info(self, address: int) -> Optional[AddressInfo]:
         """Safely retrieves AddressInfo for a given linear address."""
         if address not in self.memory:
@@ -119,7 +114,8 @@ class AnalysisDatabase:
         """Adds or updates a function in the database."""
         if start_addr in self.functions:
             # Update existing function if new end is larger
-            self.functions[start_addr].end_addr = max(self.functions[start_addr].end_addr, end_addr)
+            if end_addr:
+                self.functions[start_addr].end_addr = max(self.functions[start_addr].end_addr, end_addr)
         else:
             name = self.get_label_at(start_addr) or f"sub_{start_addr:X}"
             self.functions[start_addr] = Function(start_addr, end_addr, name)
@@ -150,4 +146,4 @@ class AnalysisDatabase:
         """Set item size at address."""
         info = self.get_address_info(addr)
         if info:
-            info.item_size = size
+            info.item_size = size\
