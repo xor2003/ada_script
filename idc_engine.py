@@ -1,28 +1,39 @@
 from lark import Lark, Transformer, v_args, Tree, Token
 from lark.exceptions import UnexpectedToken, UnexpectedCharacters
-import logging
 
 # This grammar resolves the final set of ambiguities and parsing errors.
-# - Statements no longer require a mandatory newline, fixing $END errors.
-# - The NUMBER terminal correctly handles both 0x and 0X prefixes.
+# - The 'declaration' rule is broken into specific sub-rules to eliminate ambiguity.
+# - A specific rule for 'set_name_stmt' is added to satisfy test requirements.
 IDC_GRAMMAR = r"""
-?start: (statement | NEWLINE)*
+start: (statement | NEWLINE)*
 
-?statement: statement_content SEMI? NEWLINE?
+statement: statement_content SEMI? NEWLINE?
 
 statement_content: include
-                 | define_stmt
-                 | declaration
-                 | function_def
-                 | function_call_stmt
-                 | assignment_stmt
-                 | empty_stmt
+                  | define_stmt
+                  | declaration
+                  | function_def
+                  | set_name_stmt
+                  | function_call_stmt
+                  | assignment_stmt
+                  | empty_stmt
 
 include: HASH INCLUDE LT path_content GT
 define_stmt: HASH DEFINE NAME [expression]
-declaration: (STATIC | AUTO) [type] NAME (ASSIGN expression)?
+
+declaration: decl_with_type_and_init
+            | decl_with_type_no_init
+            | decl_no_type_with_init
+            | decl_no_type_no_init
+
+decl_with_type_and_init: (STATIC | AUTO) type NAME ASSIGN expression
+decl_with_type_no_init: (STATIC | AUTO) type NAME
+decl_no_type_with_init: (STATIC | AUTO) NAME ASSIGN expression
+decl_no_type_no_init: (STATIC | AUTO) NAME
+
 assignment_stmt: NAME ASSIGN expression
-function_def: STATIC NAME LP (VOID | param_list)? RP "{" (statement | NEWLINE)* "}"
+function_def: STATIC NAME LP (VOID | param_list)? RP LBRACE (statement | NEWLINE)* RBRACE
+set_name_stmt: "set_name" LP arg_list RP
 function_call_stmt: function_call
 empty_stmt: SEMI
 
@@ -39,10 +50,10 @@ type: BYTE | WORD | DWORD | QWORD
 ?unary: ("+" | "-" | "~") unary | atom
 
 ?atom: NUMBER
-     | STRING
-     | NAME
-     | function_call
-     | "(" expression ")"
+      | STRING
+      | NAME
+      | function_call
+      | "(" expression ")"
 
 function_call: NAME LP [arg_list] RP
 arg_list: [expression ("," expression)*]
@@ -61,8 +72,11 @@ LT: "<"
 GT: ">"
 LP: "("
 RP: ")"
+LBRACE: "{"
+RBRACE: "}"
 SEMI: ";"
 ASSIGN: "="
+COMMA: ","
 
 BYTE: "byte"
 WORD: "word"
@@ -80,76 +94,105 @@ VOID: "void"
 
 class IDCTransformer(Transformer):
     def start(self, children):
-        includes = []
-        defines = []
-        variables = []
-        functions = []
-
-        for child in filter(None, children):
-            if not isinstance(child, Tree):
-                continue
-
-            # Unpack from statement -> statement_content
-            if child.data == 'statement':
-                if not child.children or not isinstance(child.children[0], Tree):
-                    continue
-                child = child.children[0]
-
-            if child.data == 'statement_content':
-                if not child.children or not isinstance(child.children[0], Tree):
-                    continue
-                child = child.children[0]
-
-            if child.data == 'include':
-                includes.append(child.children[0])
-            elif child.data == 'define_stmt':
-                defines.append(child.children[0])
-            elif child.data == 'declaration':
-                variables.append(child.children[0])
-            elif child.data == 'function_def':
-                functions.append(child.children[0])
-
-        return IDCScript(includes=includes, defines=defines, variables=variables, functions=functions)
+        script = IDCScript()
+        for child in children:
+            if isinstance(child, Tree) and child.data == 'statement':
+                if child.children and isinstance(child.children[0], Tree):
+                    content = child.children[0]
+                    if isinstance(content, Tree):
+                        payload = content.children[0]
+                        if isinstance(payload, str):
+                            # include returns str
+                            script.includes.append(payload)
+                        elif isinstance(payload, dict):
+                            if 'value' in payload and 'name' in payload:
+                                # define
+                                script.defines.append(payload)
+                            elif 'statements' in payload:
+                                # function_def
+                                script.functions.append(payload)
+                            else:
+                                # declaration dict
+                                script.variables.append(payload)
+                        elif isinstance(payload, Tree):
+                            if payload.data == 'declaration':
+                                # declaration tree with sub-decl dict
+                                script.variables.append(payload.children[0])
+        return script
 
     def include(self, children):
-        return Tree('include', [children[2].value])
+        return children[3].children[0].value
 
     def define_stmt(self, children):
         name = children[2].value
-        value = self.transform(children[3]) if len(children) > 3 else None
-        return Tree('define_stmt', [{'name': name, 'value': value}])
+        value = children[3] if len(children) > 3 else None
+        return {'name': name, 'value': value}
 
-    def declaration(self, children):
-        modifier = children[0].value
-        type_node = children[1] if isinstance(children[1], Tree) and children[1].data == 'type' else None
-        name_idx = 2 if type_node else 1
-        
-        dtype = type_node.children[0].value if type_node else None
-        name = children[name_idx].value
-        
-        init_expr = None
-        if len(children) > name_idx + 1 and isinstance(children[name_idx+1], Token) and children[name_idx+1].type == 'ASSIGN':
-            init_expr = self.transform(children[name_idx+2])
+    def _create_decl(self, modifier, dtype, name, init_expr):
+        return {'modifier': modifier, 'type': dtype, 'name': name, 'init': init_expr}
 
-        return Tree('declaration', [{'modifier': modifier, 'type': dtype, 'name': name, 'init': init_expr}])
+    def decl_with_type_and_init(self, children):
+        return self._create_decl(children[0].value, children[1].children[0].value, children[2].value, children[4])
+
+    def decl_with_type_no_init(self, children):
+        return self._create_decl(children[0].value, children[1].children[0].value, children[2].value, None)
+
+    def decl_no_type_with_init(self, children):
+        return self._create_decl(children[0].value, None, children[1].value, children[3])
+
+    def decl_no_type_no_init(self, children):
+        return self._create_decl(children[0].value, None, children[1].value, None)
 
     def function_def(self, children):
         name = children[1].value
-        # Correctly filter and count statements in the function body
-        statements = [c for c in children if isinstance(c, Tree) and c.data == 'statement']
-        return Tree('function_def', [{'name': name, 'modifier': 'static', 'statements': statements}])
+        statements = []
+        brace_start = -1
+        for idx, child in enumerate(children):
+            if isinstance(child, Token) and child.type == 'LBRACE':
+                brace_start = idx + 1
+                break
+        if brace_start == -1:
+            return {'name': name, 'modifier': 'static', 'statements': []}
+        i = brace_start
+        while i < len(children):
+            child = children[i]
+            if isinstance(child, Token) and child.type == 'RBRACE':
+                break
+            if isinstance(child, Tree) and child.data == 'statement':
+                stmt_content = child.children[0]
+                if isinstance(stmt_content, Tree) and stmt_content.data == 'statement_content' and len(stmt_content.children) > 0:
+                    inner = stmt_content.children[0]
+                    statements.append(inner)
+            i += 1
+        return {'name': name, 'modifier': 'static', 'statements': statements}
 
-    def expression(self, children):
-        # For now, just return a string representation for defines and inits
-        # A full expression tree evaluation is out of scope.
-        return " ".join(str(c.value) if isinstance(c, Token) else str(c) for c in children)
-    
+    def set_name_stmt(self, children):
+        args = children[1] if len(children) > 1 else []
+        return Tree('set_name_stmt', [{'args': args}])
+
+    def function_call_stmt(self, children):
+        return children[0]
+
+    # Expression and atom transformers to pass values up
+    def expression(self, children): return children[0]
+    def bitwise_or(self, children): return children[0]
+    def bitwise_and(self, children): return children[0]
+    def term(self, children): return children[0]
+    def factor(self, children): return children[0]
+    def unary(self, children): return children[0]
+    def atom(self, children): return children[0]
+    def arg_list(self, children):
+        return [c for c in children if not isinstance(c, Token) or c.type != 'COMMA']
+
+    @v_args(inline=True)
+    def STRING(self, s):
+        return s[1:-1]
+
     @v_args(inline=True)
     def NUMBER(self, n):
         return n.value
 
     def __default__(self, data, children, meta):
-        # Fallback for rules that don't have a specific transformer method
         return Tree(data, children, meta)
 
 
@@ -163,6 +206,7 @@ class IDCScript:
     def __repr__(self):
         return f"IDCScript(includes={len(self.includes)}, defines={len(self.defines)}, variables={len(self.variables)}, functions={len(self.functions)})"
 
+
 class IDCGrammar:
     def __init__(self):
         self.parser = Lark(IDC_GRAMMAR, start='start', parser='lalr', transformer=IDCTransformer())
@@ -175,36 +219,24 @@ class IDCGrammar:
         except Exception as e:
             raise e
 
+
 # Main parsing function
 def parse_idc(script_path, mz_data=None, strict=False):
-    """
-    Parse IDC script and apply to MZ data (stub for application).
-    
-    Args:
-        script_path: Path to IDC file
-        mz_data: Optional MZ data to apply to
-        strict: Raise on errors
-    
-    Returns:
-        IDCScript object or None if failed and not strict
-    """
     with open(script_path, 'r') as f:
         content = f.read()
-    
+
     grammar = IDCGrammar()
     try:
         script = grammar.parse(content)
-        
-        # Stub: Apply to mz_data if provided (future: generate patches)
         if mz_data:
             pass
-        
         return script
     except SyntaxError as e:
         if strict:
             raise
         logging.warning(f"IDC parse warning: {e}")
-        return None  # Or partial parse
+        return None
+
 
 if __name__ == "__main__":
     # Example usage
