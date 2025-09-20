@@ -1,5 +1,6 @@
 import logging
-from database import ITEM_TYPE_CODE
+from database import ITEM_TYPE_CODE, AnalysisDatabase, AddressInfo
+from idc_engine import IDCScript
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,20 @@ class EmulationAnalyzer:
         logger.debug(f"Disassembling {len(all_bytes)} bytes from {hex(entry)}")
         instructions = list(md.disasm(all_bytes, entry))
         logger.debug(f"Generated {len(instructions)} instructions")
+        
+        # Store instructions in DB for output generation
+        for instr in instructions:
+            addr = instr.address
+            info = self.db.get_address_info(addr)
+            if info:
+                info.instruction = instr
+                info.item_type = ITEM_TYPE_CODE
+                # Add to function disassembly if in func (init if needed)
+                func = self.db.get_function_containing(addr)
+                if func:
+                    if not hasattr(func, 'disassembly'):
+                        func.disassembly = []
+                    func.disassembly.append(f"{hex(addr)}: {instr.mnemonic} {instr.op_str}")
         
         # Enhanced function detection: scan for multiple prologue patterns
         i = 0
@@ -138,3 +153,46 @@ class EmulationAnalyzer:
     # Rest of the class remains unchanged
     def other_methods(self):
         pass
+
+
+def emulate(script: IDCScript, mz_data: dict) -> AnalysisDatabase:
+    """
+    Main emulation entry: Load MZ into DB, apply IDC basics, analyze.
+    :param script: Parsed IDCScript
+    :param mz_data: Dict from mz_parser
+    :return: Populated AnalysisDatabase
+    """
+    logger.info(f"Starting emulation with script ({len(script.variables) if script else 0} vars, {len(script.functions) if script else 0} funcs) and MZ data")
+    
+    db = AnalysisDatabase()
+    raw_bytes = mz_data['raw_bytes']
+    
+    # Populate memory with raw bytes (assume CODE for simplicity)
+    for i, b in enumerate(raw_bytes):
+        db.memory[i] = AddressInfo(i, b, ITEM_TYPE_CODE)
+    
+    db.entry_point = mz_data['entry_point']
+    db.segments = mz_data['segments']
+    db.file_format = "MZ"
+    
+    # Stub IDC application: Set labels for variables (dummy addresses based on entry)
+    if script:
+        base_addr = db.entry_point or 0x1000
+        for var in script.variables:
+            dummy_addr = base_addr + (hash(var.get('name', '')) % 0x1000)
+            db.set_label(dummy_addr, var['name'])
+            logger.debug(f"Applied IDC var label: {var['name']} at 0x{dummy_addr:x}")
+        
+        # Add script functions as DB functions (dummy ends)
+        for func_def in script.functions:
+            func_name = func_def.get('name', 'unknown')
+            func_start = base_addr + (hash(func_name) % 0x1000)
+            db.add_function(func_start, func_start + 0x100)  # Dummy size
+            logger.debug(f"Applied IDC func: {func_name} at 0x{func_start:x}")
+    
+    # Run static analysis (no full emulation for safety)
+    analyzer = EmulationAnalyzer(db)
+    analyzer.analyze()
+    
+    logger.info("Emulation/analysis completed successfully")
+    return db

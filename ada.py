@@ -3,11 +3,42 @@
 Ada Script: IDC Engine and MZ Parser
 Entry point for command-line usage.
 """
-
 import argparse
 import sys
-from idc_engine import parse_idc  # Import main parser
-from mz_parser import parse_mz_file  # Import MZ parser
+import traceback
+import logging
+
+# Setup logging early
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+try:
+    from idc_engine import parse_idc  # Import main parser
+    logger.info("IDC engine imported successfully")
+except ImportError as e:
+    logger.error(f"Failed to import idc_engine: {e}")
+    sys.exit(1)
+
+try:
+    from mz_parser import parse_mz_file  # Import MZ parser
+    logger.info("MZ parser imported successfully")
+except ImportError as e:
+    logger.error(f"Failed to import mz_parser: {e}")
+    sys.exit(1)
+
+try:
+    from emulation_analyzer import emulate  # Import emulation module
+    logger.info("Emulation analyzer imported successfully")
+except ImportError as e:
+    logger.error(f"Failed to import emulation_analyzer: {e}")
+    sys.exit(1)
+
+try:
+    from output_generator import generate_outputs  # Import output generator
+    logger.info("Output generator imported successfully")
+except ImportError as e:
+    logger.error(f"Failed to import output_generator: {e}")
+    sys.exit(1)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -15,7 +46,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s input.mz -s script.idc --debug    Parse MZ and apply IDC
+  %(prog)s input.mz -s script.idc --debug    Parse MZ, apply IDC, emulate, and generate outputs
   %(prog)s input.mz --debug                 Parse MZ only
         """
     )
@@ -27,15 +58,21 @@ Examples:
     args = parser.parse_args()
 
     if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
         print(f"Debug mode: Parsing MZ file '{args.mz_file}'", file=sys.stderr)
+        logger.debug(f"Debug mode enabled")
 
     # Parse MZ file
     try:
+        logger.info(f"Parsing MZ file: {args.mz_file}")
         mz_data = parse_mz_file(args.mz_file)
+        logger.info("MZ parsed successfully")
         if args.debug:
-            print(f"MZ parsed successfully: {len(mz_data)} sections", file=sys.stderr)
+            print(f"MZ parsed successfully: {len(mz_data.get('segments', []))} segments", file=sys.stderr)
     except Exception as e:
+        logger.error(f"Error parsing MZ: {e}")
         print(f"Error parsing MZ: {e}", file=sys.stderr)
+        traceback.print_exc()
         sys.exit(1)
 
     # Apply IDC script if provided
@@ -43,21 +80,40 @@ Examples:
         if args.debug:
             print(f"Applying IDC script '{args.script}'", file=sys.stderr)
         try:
+            logger.info(f"Applying IDC script: {args.script}")
             idc_result = parse_idc(args.script, mz_data, strict=True)
-            if idc_result is None or len(idc_result.functions) == 0:  # Check if partial/empty
+            if idc_result is None or len(idc_result.functions) == 0:  # Check if parsing failed or empty
+                logger.warning("IDC parsing returned None or empty functions")
                 print("Error applying IDC: Parsing failed", file=sys.stderr)
                 sys.exit(1)
+            logger.info(f"IDC applied successfully: {idc_result}")
             if args.debug:
                 print(f"IDC applied: {idc_result}", file=sys.stderr)
-            # Output result (stub: print summary)
-            print(f"Processed: {idc_result}")
+            # Execute emulation
+            print("Executing emulation...")
+            logger.info("Starting emulation")
+            emulated_db = emulate(idc_result, mz_data)
+            print("Emulation completed successfully.")
+            logger.info("Emulation completed")
+            # Generate outputs (unconditional for full pipeline)
+            print("Generating output files...")
+            logger.info("Generating outputs")
+            generate_outputs(emulated_db, args.mz_file)
+            print("Output files generated: .lst and .asm")
+            logger.info("Outputs generated")
         except Exception as e:
-            print(f"Error applying IDC: {e}", file=sys.stderr)
+            logger.error(f"Error in emulation or output generation: {e}")
+            print(f"Error in emulation or output generation: {e}", file=sys.stderr)
+            traceback.print_exc()
             sys.exit(1)
     else:
         # Just output MZ info (stub)
         print(f"MZ file parsed: {args.mz_file}")
-    print(f"Done.")
+        logger.info("No IDC script; MZ only")
+        if args.debug:
+            print("No IDC script provided; skipping application, emulation, and output generation.", file=sys.stderr)
+
+    print("Done.")
 
 if __name__ == "__main__":
     main()

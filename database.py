@@ -146,4 +146,4 @@ class AnalysisDatabase:
         """Set item size at address."""
         info = self.get_address_info(addr)
         if info:
-            info.item_size = size\
+            info.item_size = size

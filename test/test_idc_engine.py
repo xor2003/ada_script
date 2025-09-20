@@ -70,3 +70,54 @@ def test_parse_egame_idc_snippet(grammar):
     assert isinstance(result, IDCScript)
     assert len(result.functions) == 1
     assert result.functions[0]['name'] == 'Segments'
+def test_function_def_with_return():
+    """Test function_def handles return_stmt dict without .data error."""
+    from idc_engine import parse_idc
+    idc_content = """
+    static test_func() {
+        return id;
+    }
+    """
+    # Write temp file for test
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.idc', delete=False) as f:
+        f.write(idc_content)
+        temp_path = f.name
+    try:
+        result = parse_idc(temp_path)
+        assert result is not None
+        assert len(result.functions) == 1
+        func = result.functions[0]
+        assert 'statements' in func
+        assert len(func['statements']) == 1
+        stmt = func['statements'][0]
+        assert isinstance(stmt, dict)
+        assert stmt['type'] == 'return'
+    finally:
+        import os
+        os.unlink(temp_path)
+def test_multi_line_string_in_arg():
+    """Test parsing multi-line strings with escapes in function args."""
+    from idc_engine import parse_idc
+    from lark import Tree
+    idc_content = '''
+    static test_func() {
+        set_cmt(0x100, "Multi\\nline\\nwith \\"quote\\"", 0);
+    }
+    '''
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.idc', delete=False) as f:
+        f.write(idc_content)
+        temp_path = f.name
+    try:
+        result = parse_idc(temp_path)
+        assert result is not None
+        assert len(result.functions) == 1
+        func = result.functions[0]
+        assert 'statements' in func
+        # Find set_cmt call (as function_call)
+        has_set_cmt = any(isinstance(s, Tree) and s.data == 'function_call' and s.children[0].value == 'set_cmt' for s in func['statements'])
+        assert has_set_cmt
+    finally:
+        import os
+        os.unlink(temp_path)

@@ -16,6 +16,7 @@ statement_content: include
                   | set_name_stmt
                   | function_call_stmt
                   | assignment_stmt
+                  | return_stmt
                   | empty_stmt
 
 include: HASH INCLUDE LT path_content GT
@@ -35,11 +36,13 @@ assignment_stmt: NAME ASSIGN expression
 function_def: STATIC NAME LP (VOID | param_list)? RP LBRACE (statement | NEWLINE)* RBRACE
 set_name_stmt: "set_name" LP arg_list RP
 function_call_stmt: function_call
+return_stmt: RETURN [expression]
 empty_stmt: SEMI
 
 ?param_list: param ("," param)*
 ?param: [type] NAME
 
+?arg: (NAME ASSIGN)? expression
 type: BYTE | WORD | DWORD | QWORD
 
 ?expression: bitwise_or
@@ -50,20 +53,18 @@ type: BYTE | WORD | DWORD | QWORD
 ?unary: ("+" | "-" | "~") unary | atom
 
 ?atom: NUMBER
-      | STRING
-      | NAME
-      | function_call
-      | "(" expression ")"
+     | STRING
+     | NAME
+     | function_call
+     | "(" expression ")"
 
 function_call: NAME LP [arg_list] RP
-arg_list: [expression ("," expression)*]
+arg_list: [arg ("," arg)*]
 
 path_content: /[^>]+/
 
-NAME: /[a-zA-Z_][a-zA-Z0-9_]*/
-STRING: /"[^"]*"/
-NUMBER: /0[xX][0-9a-fA-F]+|\d+/
-
+// Keywords must come before NAME to avoid tokenization issues
+RETURN: "return"
 STATIC: "static"
 AUTO: "auto"
 HASH: "#"
@@ -85,6 +86,12 @@ QWORD: "qword"
 
 INCLUDE: "include"
 VOID: "void"
+
+// Generic NAME last
+NAME: /[a-zA-Z_][a-zA-Z0-9_]*/
+
+STRING: /"(?s:(?:[^"\\]|\\.)*)"/
+NUMBER: /0[xX][0-9a-fA-F]+|\d+/
 
 %import common.NEWLINE
 %import common.WS
@@ -166,6 +173,12 @@ class IDCTransformer(Transformer):
             i += 1
         return {'name': name, 'modifier': 'static', 'statements': statements}
 
+    def return_stmt(self, children):
+        if len(children) > 1:
+            return {'type': 'return', 'value': children[1]}
+        else:
+            return {'type': 'return', 'value': None}
+
     def set_name_stmt(self, children):
         args = children[1] if len(children) > 1 else []
         return Tree('set_name_stmt', [{'args': args}])
@@ -183,6 +196,16 @@ class IDCTransformer(Transformer):
     def atom(self, children): return children[0]
     def arg_list(self, children):
         return [c for c in children if not isinstance(c, Token) or c.type != 'COMMA']
+
+    def arg(self, children):
+        if len(children) == 1:
+            return children[0]  # positional expression
+        elif len(children) == 3:
+            name = children[0].value
+            expr = children[2]
+            return {'name': name, 'expr': expr}
+        else:
+            raise ValueError(f"Invalid arg structure: {children}")
 
     @v_args(inline=True)
     def STRING(self, s):
@@ -215,39 +238,86 @@ class IDCGrammar:
         try:
             return self.parser.parse(text)
         except (UnexpectedToken, UnexpectedCharacters) as e:
-            raise SyntaxError(f"Syntax error at line {e.line}, column {e.column}: {e}") from e
+            error_msg = f"Syntax error at line {e.line}, column {e.column}: {e}\n"
+            error_msg += f"Unexpected token: {e.token}\n"
+            error_msg += f"Expected one of: {', '.join(e.expected)}\n"
+            if hasattr(e, 'context') and e.context:
+                error_msg += f"Previous tokens: {[str(t) for t in e.context]}\n"
+            elif hasattr(e, 'token_history') and e.token_history:
+                error_msg += f"Previous tokens: {[str(t) for t in e.token_history]}\n"
+            else:
+                error_msg += "Previous tokens: []\n"
+            error_msg += f"Line content: {text.splitlines()[e.line-1] if e.line <= len(text.splitlines()) else 'EOF'}\n"
+            raise SyntaxError(error_msg) from e
         except Exception as e:
-            raise e
+            error_msg = f"Parser error: {e}\n"
+            if hasattr(e, 'line') and hasattr(e, 'column'):
+                error_msg += f"Location: line {e.line}, column {e.column}\n"
+            raise SyntaxError(error_msg) from e
 
 
 # Main parsing function
 def parse_idc(script_path, mz_data=None, strict=False):
-    with open(script_path, 'r') as f:
-        content = f.read()
+    import logging
+    try:
+        with open(script_path, 'r') as f:
+            content = f.read()
+        print(f"[DEBUG] Parsing IDC file: {script_path}")
+        print(f"[DEBUG] File content length: {len(content)} characters")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"IDC script not found: {script_path}")
 
     grammar = IDCGrammar()
     try:
         script = grammar.parse(content)
+        print(f"[DEBUG] IDC parsed successfully: {len(script.includes)} includes, {len(script.defines)} defines, {len(script.variables)} variables, {len(script.functions)} functions")
         if mz_data:
-            pass
+            print(f"[DEBUG] MZ data provided: {len(mz_data)} sections")
+            # Apply IDC to MZ (stub)
+            print("[DEBUG] Applying IDC to MZ data...")
         return script
     except SyntaxError as e:
+        error_msg = f"[ERROR] IDC parsing failed at {script_path}: {e}\n"
+        error_msg += f"[DEBUG] Error type: {type(e).__name__}\n"
+        if hasattr(e, 'line') and hasattr(e, 'column'):
+            error_msg += f"[DEBUG] Error location: line {e.line}, column {e.column}\n"
+            lines = content.splitlines()
+            if e.line <= len(lines):
+                error_msg += f"[DEBUG] Line {e.line}: {lines[e.line-1]}\n"
+                # Highlight position
+                if hasattr(e, 'column'):
+                    line_content = lines[e.line-1]
+                    error_msg += f"[DEBUG] Pointer: {line_content[:e.column-1]}{'^' * (len(str(e.token)) if hasattr(e, 'token') else 1)}\n"
+        print(error_msg)
         if strict:
             raise
-        logging.warning(f"IDC parse warning: {e}")
+        print("[DEBUG] Continuing with partial parse or None")
         return None
+    except Exception as e:
+        error_msg = f"[ERROR] Unexpected error parsing IDC: {e}\n"
+        error_msg += f"[DEBUG] Error type: {type(e).__name__}\n"
+        import traceback
+        error_msg += f"[DEBUG] Traceback: {traceback.format_exc()}\n"
+        print(error_msg)
+        raise
 
 
 if __name__ == "__main__":
     # Example usage
-    grammar = IDCGrammar()
-    result = grammar.parse("""
-    #include <some_header.idc>
-    #define UNLOADED_FILE 1
-    static byte my_var;
-    auto base = 0x10000;
-    static main() {
-        set_name("example", "Test");
-    }
-    """)
-    print(result)
+    import sys
+    if len(sys.argv) > 1:
+        result = parse_idc(sys.argv[1])
+        print(result)
+    else:
+        grammar = IDCGrammar()
+        result = grammar.parse("""
+        #include <some_header.idc>
+        #define UNLOADED_FILE 1
+        static byte my_var;
+        auto base = 0x10000;
+        static main() {
+            set_name("example", "Test");
+            return 0;
+        }
+        """)
+        print(result)
