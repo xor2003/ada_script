@@ -131,7 +131,7 @@ def main():
         logging.info(f"Pipeline complete. MD: {args.output}, LST: {lst_file}, ASM: {asm_file}")
 
     except Exception as e:
-        logging.exception(f"Pipeline failed: {e}", exc_info=args.debug)
+        logging.exception("Pipeline failed")
         sys.exit(1)
     finally:
         if 'db' in locals():

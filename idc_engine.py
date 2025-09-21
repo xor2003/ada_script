@@ -103,7 +103,9 @@ command_name: ADD_FUNC | MAKE_STRUCT | CREATE_INSN | OP_HEX | OP_STKVAR | OP_ENU
             | SET_CMT | SET_NAME | SET_INF_ATTR | ADD_SEGM_EX | SEG_RENAME | SEG_CLASS
             | DELETE_ALL_SEGMENTS | SET_PROCESSOR_TYPE | GET_INF_ATTR
 
-arg_list: (expression (COMMA expression)*)?
+arg: expression | NAME ASSIGN expression
+
+arg_list: arg? (COMMA arg)*
 
 include: HASH INCLUDE LT path_content GT
 
@@ -211,6 +213,10 @@ class IDCTransformer(Transformer):
             script.defines.append(item)
         elif item_type == 'function':
             script.functions.append(item)
+            # Recurse into statements to extract inner calls to top-level lists
+            for stmt in item.get('statements', []):
+                if isinstance(stmt, dict):
+                    self._add_item_to_script(script, stmt)
         elif 'modifier' in item:
             script.variables.append(item)
         elif item_type == 'call':
@@ -223,22 +229,23 @@ class IDCTransformer(Transformer):
                 if not hasattr(script, 'instructions'):
                     script.instructions = []
                 script.instructions.append(item)
+            elif name == 'set_cmt':
+                if not hasattr(script, 'comments'):
+                    script.comments = []
+                script.comments.append(item)
+            elif name == 'set_name':
+                if not hasattr(script, 'names'):
+                    script.names = {}
+                args = item.get('args', [])
+                if len(args) >= 2:
+                    addr = args[0] if isinstance(args[0], (int, str)) else 0
+                    name_val = args[1] if isinstance(args[1], str) else ''
+                    script.names[addr] = name_val
             else:
                 if not hasattr(script, 'operands'):
                     script.operands = []
                 script.operands.append(item)
-        elif item_type == 'set_cmt':
-            if not hasattr(script, 'comments'):
-                script.comments = []
-            script.comments.append(item)
-        elif item_type == 'set_name':
-            if not hasattr(script, 'names'):
-                script.names = {}
-            args = item.get('args', [])
-            if len(args) >= 2:
-                addr = args[0] if isinstance(args[0], (int, str)) else 0
-                name_val = args[1] if isinstance(args[1], str) else ''
-                script.names[addr] = name_val
+        # Removed unused: set_cmt/set_name handled in 'call' block now
         elif item_type in ['return', 'assign']:
             pass  # Ignore top-level in functions
 
@@ -311,11 +318,30 @@ class IDCTransformer(Transformer):
     def function_def(self, children):
         import logging
         name = children[1]
-        params = children[3] if len(children) > 3 and isinstance(children[3], list) else []
-        if len(children) == 7:
-            statements = children[5] if len(children) > 5 else []
-        else:
-            statements = children[6] if len(children) > 6 else []
+        # Handle params
+        params = []
+        if len(children) > 3:
+            params_tree = children[3]
+            if isinstance(params_tree, Token):
+                if params_tree.value in ['void', ')']:
+                    params = []
+                else:
+                    params = [params_tree]
+            elif isinstance(params_tree, Tree):
+                params = [c for c in params_tree.children if c is not None]
+            else:
+                params = params_tree or []
+        # Handle statements
+        statements = []
+        if len(children) > 5:
+            if len(children) == 7:  # no params
+                statements_tree = children[5]
+            else:  # with params or VOID
+                statements_tree = children[6]
+            if isinstance(statements_tree, Tree):
+                statements = [c for c in statements_tree.children if c and not (isinstance(c, Token) and c.type == 'NEWLINE')]
+            else:
+                statements = statements_tree or []
         if not isinstance(statements, list):
             statements = [statements]
         result = {'type': 'function', 'name': name, 'params': params, 'modifier': 'static', 'statements': statements}
@@ -325,59 +351,75 @@ class IDCTransformer(Transformer):
     def statements(self, children):
         return [c for c in children if c and not (isinstance(c, Token) and c.type == 'NEWLINE')]
 
-    def command_stmt(self, children):
+    def _flatten_statements(self, tree):
+        if isinstance(tree, Tree) and tree.data == 'statements':
+            return [self.transform(c) for c in tree.children if c and not (isinstance(c, Token) and c.type == 'NEWLINE')]
+        elif isinstance(tree, list):
+            return tree
+        else:
+            return []
+
+    @v_args(inline=True)
+    def command_stmt(self, name, lp, args, rp):
         import logging
-        logging.info(f"command_stmt children[0]: type={type(children[0])}, value={getattr(children[0], 'value', str(children[0])) if children[0] else None}, full children={[type(c).__name__ for c in children]}")
-        name = children[0].value if isinstance(children[0], Token) else children[0]
-        args = children[2] if isinstance(children[2], list) else [children[2]]
-        result = {'type': 'call', 'name': name, 'args': args}
-        logging.debug(f"Command parsed: {name}, args_len={len(args)}")
+        logging.info(f"command_stmt name: {name}, args: {args}")
+        result = {'type': 'call', 'name': name, 'args': args or []}
+        logging.debug(f"Command parsed: {name}, args_len={len(result['args'])}")
         return result
 
-    def return_stmt(self, children):
-        expr = children[1] if len(children) > 1 else None
+    @v_args(inline=True)
+    def arg_list(self, *args):
+        return [a for a in args if a is not None]
+
+    @v_args(inline=True)
+    def arg(self, *children):
+        if len(children) == 3 and children[1] == '=':
+            return {'type': 'assign', 'left': children[0], 'op': '=', 'right': children[2]}
+        elif len(children) == 1:
+            return children[0]
+        else:
+            raise ValueError(f"Unexpected arg children: {children}")
+
+    @v_args(inline=True)
+    def return_stmt(self, kw, expr=None):
         return {'type': 'return', 'expr': expr}
 
-    def assignment_stmt(self, children):
-        if len(children) == 3:
-            return {'type': 'assign', 'name': children[0], 'expr': children[2]}
-        return {}
+    @v_args(inline=True)
+    def assignment_stmt(self, name, op, expr):
+        return {'type': 'assign', 'name': name, 'op': op, 'expr': expr}
 
-    def function_call(self, children):
+    @v_args(inline=True)
+    def function_call(self, name, lp, args, rp):
         import logging
-        logging.info(f"function_call children[0]: type={type(children[0])}, value={getattr(children[0], 'value', str(children[0])) if children[0] else None}, full children={[type(c).__name__ for c in children]}")
-        name = children[0].value if isinstance(children[0], Token) else children[0]
-        args = children[2] if isinstance(children[2], list) else [children[2]]
-        return {'type': 'call', 'name': name, 'args': args}
+        logging.info(f"function_call name: {name}, args: {args}")
+        return {'type': 'call', 'name': name, 'args': args or []}
 
     def function_call_stmt(self, children):
         return children[0] if children else {'type': 'call', 'name': '', 'args': []}
 
-    def expression(self, children):
-        return children[0] if children else None
+    def assignment(self, children):
+        if len(children) == 1:
+            return children[0]
+        left = children[0]
+        i = 1
+        while i < len(children):
+            op = children[i]
+            right = children[i + 1]
+            left = {'type': 'assign', 'left': left, 'op': op, 'right': right}
+            i += 2
+        return left
 
-    def bitwise_or(self, children):
-        return self._build_binop(children, '|')
+    @v_args(inline=True)
+    def arg(self, *children):
+        if len(children) == 3 and children[1] == '=':
+            return {'type': 'assign', 'left': children[0], 'op': '=', 'right': children[2]}
+        elif len(children) == 1:
+            return children[0]
+        else:
+            raise ValueError(f"Unexpected arg children: {children}")
 
-    def bitwise_and(self, children):
-        return self._build_binop(children, '&')
-
-    def equality(self, children):
-        return self._build_binop(children, '==', '!=')
-
-    def relational(self, children):
-        return self._build_binop(children, '<', '>', '<=', '>=')
-
-    def shift(self, children):
-        return self._build_binop(children, '<<', '>>')
-
-    def additive(self, children):
-        return self._build_binop(children, '+', '-')
-
-    def multiplicative(self, children):
-        return self._build_binop(children, '*', '/', '%')
-
-    def _build_binop(self, children, *ops):
+    @v_args(inline=True)
+    def bitwise_or(self, *children):
         if len(children) == 1:
             return children[0]
         left = children[0]
@@ -389,12 +431,91 @@ class IDCTransformer(Transformer):
             i += 2
         return left
 
-    def unary(self, children):
+    @v_args(inline=True)
+    def bitwise_and(self, *children):
         if len(children) == 1:
             return children[0]
-        op = children[0]
-        operand = children[1]
+        left = children[0]
+        i = 1
+        while i < len(children):
+            op = children[i]
+            right = children[i + 1]
+            left = {'type': 'binary', 'op': op, 'left': left, 'right': right}
+            i += 2
+        return left
+
+    @v_args(inline=True)
+    def equality(self, *children):
+        if len(children) == 1:
+            return children[0]
+        left = children[0]
+        i = 1
+        while i < len(children):
+            op = children[i]
+            right = children[i + 1]
+            left = {'type': 'binary', 'op': op, 'left': left, 'right': right}
+            i += 2
+        return left
+
+    @v_args(inline=True)
+    def relational(self, *children):
+        if len(children) == 1:
+            return children[0]
+        left = children[0]
+        i = 1
+        while i < len(children):
+            op = children[i]
+            right = children[i + 1]
+            left = {'type': 'binary', 'op': op, 'left': left, 'right': right}
+            i += 2
+        return left
+
+    @v_args(inline=True)
+    def shift(self, *children):
+        if len(children) == 1:
+            return children[0]
+        left = children[0]
+        i = 1
+        while i < len(children):
+            op = children[i]
+            right = children[i + 1]
+            left = {'type': 'binary', 'op': op, 'left': left, 'right': right}
+            i += 2
+        return left
+
+    @v_args(inline=True)
+    def additive(self, *children):
+        if len(children) == 1:
+            return children[0]
+        left = children[0]
+        i = 1
+        while i < len(children):
+            op = children[i]
+            right = children[i + 1]
+            left = {'type': 'binary', 'op': op, 'left': left, 'right': right}
+            i += 2
+        return left
+
+    @v_args(inline=True)
+    def multiplicative(self, *children):
+        if len(children) == 1:
+            return children[0]
+        left = children[0]
+        i = 1
+        while i < len(children):
+            op = children[i]
+            right = children[i + 1]
+            left = {'type': 'binary', 'op': op, 'left': left, 'right': right}
+            i += 2
+        return left
+
+
+    @v_args(inline=True)
+    def unary(self, op, operand):
         return {'type': 'unary', 'op': op, 'operand': operand}
+
+    def conditional_expr(self, children):
+        return self.bitwise_or(children)
 
     def postfix(self, children):
         base = children[0]
@@ -417,8 +538,21 @@ class IDCTransformer(Transformer):
                 i += 1
         return base
 
-    def primary(self, children):
-        return children[0]
+    @v_args(inline=True)
+    def primary(self, value):
+        return value
+
+    def simple_assign(self, children):
+        left = children[0]
+        op = children[1]
+        right = children[2]
+        return {'type': 'assign', 'left': left, 'op': op, 'right': right}
+
+    def simple_assignment(self, children):
+        left = children[0]
+        op = children[1]
+        right = children[2]
+        return {'type': 'assign', 'left': left, 'op': op, 'right': right}
 
     @v_args(inline=True)
     def NUMBER(self, n): return int(n)
@@ -525,7 +659,7 @@ class IDCTransformer(Transformer):
         return args
 
     def param_list(self, children):
-        params = [c for c in children if c != ',']
+        params = [self.transform(c) for c in children if c != ',']
         return params
 
     def param(self, children):
@@ -544,65 +678,9 @@ class IDCTransformer(Transformer):
         return non_none if data in ['statements', 'arg_list', 'param_list'] else Tree(data, non_none)
 
 
-# Duplicated _add_item_to_script removed
-
-# Duplicated statement removed
-
-    # Duplicated statement_content removed
-    # Duplicated include removed
-    # Duplicated path removed
-    # Duplicated define_stmt removed
-    # Duplicated _create_decl removed
-    # Duplicated decl_with_type_and_init removed
-    # Duplicated decl_with_type_no_init removed
-    # Duplicated decl_no_type_with_init removed
-    # Duplicated decl_no_type_no_init removed
-    # Duplicated declaration removed
-    # Duplicated function_def removed
-    # Duplicated statements removed
-    # Duplicated command_stmt removed
-    # Duplicated return_stmt removed
-    # Duplicated assignment_stmt removed
-    # Duplicated function_call removed
-    # Duplicated function_call_stmt removed
-    # Duplicated expression removed
-    # Duplicated bitwise_or removed
-    # Duplicated bitwise_and removed
-    # Duplicated equality removed
-    # Duplicated relational removed
-    # Duplicated shift removed
-    # Duplicated additive removed
-    # Duplicated multiplicative removed
-    # Duplicated _build_binop removed
-    # Duplicated unary removed
-    # Duplicated postfix removed
-    # Duplicated primary removed
-    # Duplicated NUMBER removed
-    # Duplicated hex_value removed
-    # Duplicated hex_addr removed
-    # Duplicated STRING removed
-    # Duplicated NAME removed
-    # Duplicated path_content removed
-    # Duplicated STATIC removed
-    # Duplicated AUTO removed
-    # Duplicated BYTE removed
-    # Duplicated WORD removed
-    # Duplicated DWORD removed
-    # Duplicated QWORD removed
-    # Duplicated VOID removed
-    # Duplicated HASH removed
-    # Duplicated INCLUDE removed
-    # Duplicated DEFINE removed
-    # Duplicated RETURN removed
-    # Duplicated lt removed
-    # Duplicated gt removed
-    # Duplicated arg_list removed
-    # Duplicated param_list removed
-    # Duplicated param removed
-    # Duplicated __default__ removed
 
 class IDCScript:
-    def __init__(self, includes=None, defines=None, variables=None, functions=None, operands=None, comments=None, names=None, db=None):
+    def __init__(self, includes=None, defines=None, variables=None, functions=None, operands=None, comments=None, names=None, instructions=None, db=None):
         self.includes = includes or []
         self.defines = defines or []
         self.variables = variables or []
@@ -610,42 +688,41 @@ class IDCScript:
         self.operands = operands or []
         self.comments = comments or []
         self.names = names or {}
+        self.instructions = instructions or []
         self.db = db
 
     def insert_to_db(self):
         if not self.db:
             return
-        try:
-            # Insert functions (use name if available, else sub_addr)
-            for func in self.functions:
-                start = func.get('start', 0)
-                end = func.get('end', 0)
-                name = func.get('name', f"sub_{start:X}")
-                self.db.execute("INSERT OR REPLACE INTO functions (start, end, name) VALUES (?, ?, ?)", (start, end, name))
-            # Insert symbols/names
-            for addr, name in self.names.items():
-                self.db.execute("INSERT OR REPLACE INTO symbols (addr, name) VALUES (?, ?)", (addr, name))
-                # Update functions if matches start
-                self.db.execute("UPDATE functions SET name = ? WHERE start = ?", (name, addr))
-            # Insert comments
-            for cmt in self.comments:
-                addr = cmt.get('addr', 0)
-                text = cmt.get('text', '')
-                self.db.execute("INSERT OR REPLACE INTO comments (addr, comment) VALUES (?, ?)", (addr, text))
-            # Insert instructions from create_insn
-            for insn in self.instructions or []:
-                addr = insn.get('addr', 0)
-                self.db.execute("INSERT OR IGNORE INTO instructions (addr, size, mnem, op_str, type) VALUES (?, ?, ?, ?, ?)", (addr, 0, '', '', 'code'))  # Stub size/mnem
-            # Structs as variables if MakeStruct-like
-            for var in self.variables:
-                if var.get('type') == 'struct':
-                    name = var.get('name', '')
-                    size = var.get('size', 0)
-                    # Assume custom table or use symbols
-                    self.db.execute("INSERT OR IGNORE INTO symbols (addr, name) VALUES (?, ?)", (0, f"struct_{name}_{size}"))
-            logging.info(f"IDC DB inserts: {len(self.functions)} funcs, {len(self.names)} names, {len(self.comments)} comments")
-        except Exception as e:
-            logging.warning(f"DB insert failed: {e}")
+        # Insert functions (use name if available, else sub_addr)
+        for func in self.functions:
+            start = func.get('start', 0)
+            end = func.get('end', 0)
+            name = func.get('name', f"sub_{start:X}")
+            self.db.execute("INSERT OR REPLACE INTO functions (start, end, name) VALUES (?, ?, ?)", (start, end, name))
+        # Insert symbols/names
+        for addr, name in self.names.items():
+            self.db.execute("INSERT OR REPLACE INTO symbols (addr, name) VALUES (?, ?)", (addr, name))
+            # Update functions if matches start
+            self.db.execute("UPDATE functions SET name = ? WHERE start = ?", (name, addr))
+        # Insert comments
+        for cmt in self.comments:
+            addr = cmt.get('addr', 0)
+            text = cmt.get('text', '')
+            self.db.execute("INSERT OR REPLACE INTO comments (addr, comment) VALUES (?, ?)", (addr, text))
+        # Insert instructions from create_insn
+        for insn in self.instructions:
+            addr = insn.get('addr', 0)
+            self.db.execute("INSERT OR IGNORE INTO instructions (addr, size, mnem, op_str, type) VALUES (?, ?, ?, ?, ?)", (addr, 0, '', '', 'code'))  # Stub size/mnem
+        # Structs as variables if MakeStruct-like
+        for var in self.variables:
+            if var.get('type') == 'struct':
+                name = var.get('name', '')
+                size = var.get('size', 0)
+                # Assume custom table or use symbols
+                self.db.execute("INSERT OR IGNORE INTO symbols (addr, name) VALUES (?, ?)", (0, f"struct_{name}_{size}"))
+        logging.info(f"IDC DB inserts: {len(self.functions)} funcs, {len(self.names)} names, {len(self.comments)} comments")
+
 
     def __repr__(self):
         return f"IDCScript(includes={len(self.includes)}, defines={len(self.defines)}, variables={len(self.variables)}, functions={len(self.functions)}, operands={len(self.operands)}, comments={len(self.comments)}, names={len(self.names)})"
@@ -665,7 +742,7 @@ class IDCGrammar:
             logging.debug(f"Parser tree: data={tree.data}, children_len={len(tree.children)}")
             script = self.transformer.transform(tree)
             logging.debug(f"Parse result type: {type(script).__name__}, summary: {script}")
-            if strict and (len(script.includes) + len(script.defines) + len(script.variables) + len(script.functions) + len(getattr(script, 'operands', [])) + len(getattr(script, 'comments', [])) + len(script.names)) == 0:
+            if strict and (len(script.includes) + len(script.defines) + len(script.variables) + len(script.functions) + len(getattr(script, 'operands', [])) + len(getattr(script, 'comments', [])) + len(script.names) + len(getattr(script, 'instructions', []))) == 0:
                 logging.warning("Empty script detected in strict mode")
                 raise SyntaxError("Parse resulted in empty script")
             return script
