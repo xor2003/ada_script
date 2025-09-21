@@ -61,4 +61,5 @@ python -c "from idc_engine import parse_idc; print(parse_idc('egame.idc', {}))"
 ### Real Processing Workflow
 To run the full processing pipeline:
 ```bash
-python ada.py egame.exe -s egame.idc --debug
+python ada.py egame.exe -s egame.idc --debug --full --classify --xrefs
+```

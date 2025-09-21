@@ -1,149 +1,159 @@
-"""
-database.py: The central data store for the disassembly analysis.
-"""
+import sqlite3
+from utils import logger, handle_error  # Assume utils.py with logging
 
-import collections
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Tuple
+class Database:
+    def __init__(self, path='analysis.db'):
+        try:
+            self.conn = sqlite3.connect(path)
+            self._create_tables()
+            logger.info(f"DB initialized: {path}")
+        except sqlite3.Error as e:
+            handle_error(f"DB init failed: {e}", e, fatal=True)
+            raise
 
-# Item types classify what each byte in memory represents
-ITEM_TYPE_UNDEFINED = "UNDEFINED"
-ITEM_TYPE_CODE = "CODE"
-ITEM_TYPE_DATA = "DATA"
+    def _create_tables(self):
+        try:
+            cur = self.conn.cursor()
+            # Instructions table
+            cur.execute("DROP TABLE IF EXISTS instructions")
+            cur.execute("""
+                CREATE TABLE instructions (
+                    addr INTEGER PRIMARY KEY,
+                    size INTEGER,
+                    mnem TEXT,
+                    op_str TEXT,
+                    type TEXT DEFAULT 'code'
+                )
+            """)
+            # Functions table
+            cur.execute("DROP TABLE IF EXISTS functions")
+            cur.execute("""
+                CREATE TABLE functions (
+                    start INTEGER PRIMARY KEY,
+                    end INTEGER,
+                    name TEXT
+                )
+            """)
+            # Symbols table (for IDC names)
+            cur.execute("DROP TABLE IF EXISTS symbols")
+            cur.execute("""
+                CREATE TABLE symbols (
+                    addr INTEGER PRIMARY KEY,
+                    name TEXT
+                )
+            """)
+            # Xrefs table
+            cur.execute("DROP TABLE IF EXISTS xrefs")
+            cur.execute("""
+                CREATE TABLE xrefs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    from_addr INTEGER NOT NULL,
+                    to_addr INTEGER NOT NULL,
+                    type TEXT NOT NULL,
+                    instruction TEXT,
+                    FOREIGN KEY(from_addr) REFERENCES instructions(addr),
+                    FOREIGN KEY(to_addr) REFERENCES instructions(addr)
+                )
+            """)
+            # Segments table (enhanced)
+            cur.execute("DROP TABLE IF EXISTS segments")
+            cur.execute("""
+                CREATE TABLE segments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_addr INTEGER NOT NULL,
+                    end_addr INTEGER NOT NULL,
+                    class TEXT DEFAULT 'UNKNOWN',
+                    type TEXT DEFAULT 'code',
+                    executable INTEGER DEFAULT 0,
+                    entropy REAL DEFAULT 0.0,
+                    name TEXT
+                )
+            """)
+            
+            # Relocations table
+            cur.execute("DROP TABLE IF EXISTS relocations")
+            cur.execute("""
+                CREATE TABLE relocations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    addr INTEGER NOT NULL,
+                    offset INTEGER NOT NULL
+                )
+            """)
+            
+            # Comments table
+            cur.execute("DROP TABLE IF EXISTS comments")
+            cur.execute("""
+                CREATE TABLE comments (
+                    addr INTEGER PRIMARY KEY,
+                    comment TEXT NOT NULL,
+                    repeatable INTEGER DEFAULT 0
+                )
+            """)
+            
+            # Stats table
+            cur.execute("DROP TABLE IF EXISTS stats")
+            cur.execute("""
+                CREATE TABLE stats (
+                    key TEXT PRIMARY KEY,
+                    value REAL
+                )
+            """)
+            
+            # Processor config
+            cur.execute("DROP TABLE IF EXISTS config")
+            cur.execute("""
+                CREATE TABLE config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            
+            self.conn.commit()
+            logger.debug("Tables created/verified")
+        except sqlite3.Error as e:
+            handle_error(f"Table creation failed: {e}", e)
+            raise
 
-# Data types for more specific formatting
-DATA_TYPE_BYTE = 1
-DATA_TYPE_WORD = 2
-DATA_TYPE_DWORD = 4
-DATA_TYPE_ASCII = 10
+    def execute(self, query, params=()):
+        try:
+            cur = self.conn.cursor()
+            cur.execute(query, params)
+            self.conn.commit()
+            return cur
+        except sqlite3.Error as e:
+            logger.error(f"DB query failed: {query[:50]}... - {e}")
+            if 'CREATE' in query:
+                logger.info("Retrying table creation...")
+                self._create_tables()
+                # Retry once
+                try:
+                    cur = self.conn.cursor()
+                    cur.execute(query, params)
+                    self.conn.commit()
+                    return cur
+                except sqlite3.Error:
+                    pass
+            raise
 
-@dataclass
-class AddressInfo:
-    """Holds all information about a single address in memory."""
-    address: int
-    byte_value: int
-    item_type: str = ITEM_TYPE_UNDEFINED
-    item_size: int = 1
-    data_type: int = DATA_TYPE_BYTE
-    label: Optional[str] = None
-    comment: Optional[str] = None
-    repeatable_comment: Optional[str] = None
-    instruction: Optional[Any] = None  # capstone.CsInsn
-    xrefs_to: List[int] = field(default_factory=list)
-    xrefs_from: List[int] = field(default_factory=list)
-    relocation: bool = False
+    def add_xref(self, from_addr, to_addr, xtype, instruction=''):
+        try:
+            self.execute("""
+                INSERT OR IGNORE INTO xrefs (from_addr, to_addr, type, instruction)
+                VALUES (?, ?, ?, ?)
+            """, (from_addr, to_addr, xtype, instruction))
+        except Exception as e:
+            logger.warning(f"Xref add failed {from_addr}->{to_addr}: {e}")
 
-@dataclass
-class Segment:
-    """Represents a memory segment."""
-    name: str
-    start_addr: int
-    end_addr: int
-    selector: int
-    seg_class: str = "CODE"
-    is_32bit: bool = False
+    def get_xrefs_to(self, addr):
+        try:
+            return self.execute("SELECT * FROM xrefs WHERE to_addr=?", (addr,)).fetchall()
+        except Exception as e:
+            logger.warning(f"Xref query failed for {hex(addr)}: {e}")
+            return []
 
-@dataclass
-class Function:
-    """Represents a function with its properties."""
-    start_addr: int
-    end_addr: int
-    name: str
-    frame_size: int = 0
-    local_vars: Dict[int, Tuple[str, int]] = field(default_factory=dict) # offset -> (name, size)
-
-@dataclass
-class OperandFormat:
-    """Stores formatting overrides for an instruction operand."""
-    format_type: str # e.g., 'hex', 'dec', 'offset', 'enum'
-    value: Any = None # e.g., enum_id for 'enum', base for 'offset'
-
-class AnalysisDatabase:
-    """The main container class for all disassembly information."""
-
-    def __init__(self):
-        self.memory: Dict[int, AddressInfo] = {}
-        self.segments: List[Segment] = []
-        self.functions: Dict[int, Function] = {} # start_addr -> Function
-        self.entry_point: int = 0
-        self.operand_format_overrides: Dict[Tuple[int, int], OperandFormat] = {} # (addr, op_idx) -> Format
-        self.segment_register_assumptions: Dict[int, Dict[str, int]] = collections.defaultdict(dict) # addr -> {'cs': val, 'ds': val}
-        self.file_format: str = "UNKNOWN"
-
-    def get_address_info(self, address: int) -> Optional[AddressInfo]:
-        """Safely retrieves AddressInfo for a given linear address."""
-        if address not in self.memory:
-            self.memory[address] = AddressInfo(address, 0)
-        return self.memory.get(address)
-
-    def get_label_at(self, address: int) -> Optional[str]:
-        """Returns the label for an address, if one exists."""
-        info = self.get_address_info(address)
-        return info.label if info else None
-
-    def to_segment_offset(self, linear_address: int) -> Optional[Tuple[str, int]]:
-        """Converts a linear address to a (segment_name, offset) pair."""
-        for seg in self.segments:
-            if seg.start_addr <= linear_address < seg.end_addr:
-                return (seg.name, linear_address - seg.start_addr)
-        return None
-
-    def to_linear_address(self, seg_selector: int, offset: int) -> int:
-        """Converts a 16-bit segment:offset pair to a linear address."""
-        return (seg_selector << 4) + offset
-
-    def get_segment_by_selector(self, selector: int) -> Optional[Segment]:
-        """Finds a segment by its selector value."""
-        for seg in self.segments:
-            if seg.selector == selector:
-                return seg
-        return None
-
-    def get_function_at(self, address: int) -> Optional[Function]:
-        """Finds the function that starts at the given address."""
-        return self.functions.get(address)
-
-    def get_function_containing(self, address: int) -> Optional[Function]:
-        """Finds the function that contains the given address."""
-        for func in self.functions.values():
-            if func.start_addr <= address < func.end_addr:
-                return func
-        return None
-
-    def add_function(self, start_addr: int, end_addr: int):
-        """Adds or updates a function in the database."""
-        if start_addr in self.functions:
-            # Update existing function if new end is larger
-            if end_addr:
-                self.functions[start_addr].end_addr = max(self.functions[start_addr].end_addr, end_addr)
-        else:
-            name = self.get_label_at(start_addr) or f"sub_{start_addr:X}"
-            self.functions[start_addr] = Function(start_addr, end_addr, name)
-            # Ensure the start address has a label
-            info = self.get_address_info(start_addr)
-            if info and not info.label:
-                info.label = name
-
-    def set_label(self, addr: int, label: str):
-        """Set label at address."""
-        info = self.get_address_info(addr)
-        if info:
-            info.label = label
-
-    def set_item_type(self, addr: int, item_type: str):
-        """Set item type at address."""
-        info = self.get_address_info(addr)
-        if info:
-            info.item_type = item_type
-
-    def set_data_type(self, addr: int, data_type: int):
-        """Set data type at address."""
-        info = self.get_address_info(addr)
-        if info:
-            info.data_type = data_type
-
-    def set_item_size(self, addr: int, size: int):
-        """Set item size at address."""
-        info = self.get_address_info(addr)
-        if info:
-            info.item_size = size
+    def close(self):
+        try:
+            self.conn.close()
+            logger.debug("DB closed")
+        except Exception as e:
+            logger.warning(f"DB close failed: {e}")

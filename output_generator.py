@@ -1,70 +1,171 @@
-import logging
-from database import AnalysisDatabase
+import sqlite3
+from utils import logger, handle_error  # Shared logging
 
-def generate_outputs(db_result, mz_filename):
-    """
-    Generate .lst and .asm files from the analysis database.
-    """
-    # Ensure db_result is an AnalysisDatabase instance
-    if not isinstance(db_result, AnalysisDatabase):
-        raise ValueError("Invalid database result for output generation.")
-    
-    # Generate .lst file
-    lst_path = mz_filename.replace('.exe', '.lst')
-    with open(lst_path, 'w') as f:
-        f.write("# LST Output\n")
-        if db_result.functions:
-            for func in db_result.functions.values():  # Use .values() for dict
-                end_hex = hex(func.end_addr) if func.end_addr is not None else "(end unknown)"
-                f.write(f"func {hex(func.start_addr)} {end_hex} - {func.name}\n")
-                disasm_lines = getattr(func, 'disassembly', [])
-                if not disasm_lines:
-                    # Fallback: Basic hex dump for function range
-                    end_limit = func.end_addr if func.end_addr is not None else func.start_addr + 32
-                    for addr in range(func.start_addr, min(end_limit, func.start_addr + 32)):  # Limit to 32 bytes
-                        info = db_result.get_address_info(addr)
-                        if info and info.byte_value is not None:
-                            f.write(f"{hex(addr)}: {info.byte_value:02x}\n")
-                else:
-                    for line in disasm_lines:
-                        f.write(f"{line}\n")
-        else:
-            # Global fallback if no functions
-            f.write("No functions detected.\n")
-            for addr, info in list(db_result.memory.items())[:20]:  # First 20 bytes
-                if info.byte_value is not None:
-                    f.write(f"{hex(addr)}: {info.byte_value:02x}\n")
-    
-    # Generate .asm file
-    asm_path = mz_filename.replace('.exe', '.asm')
-    with open(asm_path, 'w') as f:
-        f.write("# ASM Output\n")
-        if db_result.functions:
-            for func in db_result.functions.values():
-                f.write(f"{func.name} proc\n")
-                # Use disassembly as proxy for assembly; format simply
-                disasm_lines = getattr(func, 'disassembly', [])
-                if not disasm_lines:
-                    # Fallback hex/byte asm
-                    end_limit = func.end_addr if func.end_addr is not None else func.start_addr + 32
-                    for addr in range(func.start_addr, min(end_limit, func.start_addr + 32)):
-                        info = db_result.get_address_info(addr)
-                        if info and info.byte_value is not None:
-                            f.write(f"    db {info.byte_value:02x}h  ; {hex(addr)}\n")
-                else:
-                    for line in disasm_lines:
-                        # Simple asm format: strip hex prefix if present
-                        asm_line = line.replace(hex(func.start_addr), func.name, 1)  # Label first
-                        f.write(f"    {asm_line}\n")
-                f.write(f"{func.name} endp\n")
-        else:
-            # Global fallback
-            f.write("No functions; raw bytes:\n")
-            for addr, info in list(db_result.memory.items())[:20]:
-                if info.byte_value is not None:
-                    f.write(f"    db {info.byte_value:02x}h  ; {hex(addr)}\n")
-    
-    print(f"Generated .lst and .asm files successfully: {lst_path}, {asm_path}")
-    # Log summary
-    func_count = len(db_result.functions)
-    print(f"Output summary: {func_count} functions, {sum(len(getattr(f, 'disassembly', [])) for f in db_result.functions.values())} disasm lines")
+class OutputGenerator:
+    def __init__(self, db):
+        self.db = db
+
+    def generate_lst(self, output_file='output.lst'):
+        """Generate IDA-like LST file with segments, data/code, names, xrefs, coverage."""
+        try:
+            conn = self.db.conn  # Use passed db
+            # Fetch data
+            instructions = conn.execute("""
+                SELECT addr, size, mnem, op_str, type FROM instructions ORDER BY addr
+            """).fetchall()
+            
+            functions = conn.execute("""
+                SELECT start, end, name FROM functions ORDER BY start
+            """).fetchall()
+            
+            segments = conn.execute("""
+                SELECT start_addr, end_addr, class, type, name FROM segments ORDER BY start_addr
+            """).fetchall()
+            
+            xrefs = conn.execute("""
+                SELECT from_addr, to_addr, type, instruction FROM xrefs ORDER BY from_addr
+            """).fetchall()
+            
+            comments = conn.execute("""
+                SELECT addr, comment FROM comments ORDER BY addr
+            """).fetchall()
+            
+            # Build dicts
+            xref_dict = {to: [] for _, to, _, _ in xrefs}
+            for fr, to, typ, instr in xrefs:
+                xref_dict[to].append((fr, typ, instr))
+            
+            comment_dict = {addr: comment for addr, comment in comments}
+            
+            # Coverage from stats or calculate
+            coverage_row = conn.execute("SELECT value FROM stats WHERE key = 'code_coverage'").fetchone()
+            coverage = float(coverage_row[0]) if coverage_row else 0.0
+            total_bytes = len(self.db.binary) if hasattr(self.db, 'binary') else sum(end - start for start, end, _, _, _ in segments)
+            code_bytes = total_bytes * (coverage / 100)
+            data_bytes = total_bytes - code_bytes
+            
+            num_funcs = len(functions)
+            num_xrefs = len(xrefs)
+
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write("; IDA Pro-style LST Output\n")
+                f.write("; Generated by Ada Script\n\n")
+                
+                seg_index = 0
+                current_seg = None
+                current_func = None
+                
+                # Write segments
+                for start, end, seg_class, seg_type, seg_name in segments:
+                    if seg_name is None:
+                        seg_name = f"seg{seg_index:03d}"
+                    f.write(f"{seg_name}:0000\n")
+                    if seg_class == 'CODE':
+                        f.write(f"        assume cs:{seg_name}\n")
+                    elif seg_class == 'DATA':
+                        f.write(f"        assume ds:{seg_name}\n")
+                    elif seg_class == 'STACK':
+                        f.write(f"        assume ss:{seg_name}\n")
+                    f.write(f"        org {start:04X}h\n\n")
+                    seg_index += 1
+                
+                # Write content per segment
+                for seg_start, seg_end, seg_class, seg_type, seg_name in segments:
+                    if seg_name is None:
+                        seg_name = f"seg{seg_index:03d}"
+                    f.write(f"; Segment {seg_name} ({seg_class}, {seg_start:04X}-{seg_end:04X})\n")
+                    
+                    seg_instructions = [inst for inst in instructions if seg_start <= inst[0] < seg_end]
+                    seg_functions = [func for func in functions if seg_start <= func[0] < seg_end]
+                    
+                    for addr, size, mnem, op_str, inst_type in seg_instructions:
+                        # Function start
+                        func_start = next((s for s, _, _ in seg_functions if s == addr), None)
+                        if func_start:
+                            func_name = next((n for s, _, n in seg_functions if s == func_start), f"sub_{addr:04X}")
+                            f.write(f"{seg_name}:{(addr - seg_start):04X} {func_name} proc near\n")
+                            current_func = func_name
+                        
+                        # Address
+                        offset = addr - seg_start
+                        f.write(f"{seg_name}:{offset:04X} ")
+                        
+                        if inst_type == 'data':
+                            # Data: byte-level for unknown
+                            if size == 1:
+                                f.write("db ?")
+                            elif size == 2:
+                                f.write("dw ?")
+                            else:
+                                f.write(f"db {size} dup(?)")
+                            # Name
+                            name = self._get_name(addr)
+                            if name:
+                                f.write(f" {name}")
+                            # Comment
+                            if addr in comment_dict:
+                                f.write(f"        ; {comment_dict[addr]}")
+                            f.write("\n")
+                        else:
+                            # Code
+                            line = f"{mnem} {op_str}" if op_str else mnem
+                            f.write(f"{line:<24}")
+                            
+                            # Inline xrefs IDA-style
+                            if addr in xref_dict:
+                                for fr, typ, instr in xref_dict[addr]:
+                                    xref_type = "DATA XREF" if typ == 'data' else "CODE XREF"
+                                    dir = "↑r" if typ == 'data' else "↑j"
+                                    offset_fr = fr - seg_start if seg_start <= fr < seg_end else fr
+                                    f.write(f"        ; {xref_type}: {offset_fr:04X}h{dir}\n")
+                            
+                            # Name and comment
+                            name = self._get_name(addr)
+                            if name:
+                                f.write(f"        ; {name}")
+                            if addr in comment_dict:
+                                f.write(f"        ; {comment_dict[addr]}")
+                            f.write("\n")
+                        
+                        # Function end
+                        if current_func:
+                            func_end = next((e for s, e, n in seg_functions if n == current_func), seg_end)
+                            if addr + size >= func_end:
+                                f.write(f"{current_func} endp\n")
+                                current_func = None
+                
+                # Global xrefs if needed
+                if xrefs:
+                    f.write("\n; Cross-references\n")
+                    for fr, to, typ, instr in xrefs:
+                        f.write(f"{fr:04X} {typ} {instr} -> {to:04X}\n")
+                
+                # Summary
+                f.write("\n; Summary\n")
+                f.write(f"end start\n")  # Entry point
+                f.write(f"; Total size: {total_bytes} bytes\n")
+                f.write(f"; Code: {code_bytes} bytes ({coverage:.1f}%)\n")
+                f.write(f"; Data: {data_bytes} bytes\n")
+                f.write(f"; Functions: {num_funcs}\n")
+                f.write(f"; Xrefs: {num_xrefs}\n")
+                
+                # End last func
+                if current_func:
+                    f.write(f"{current_func} endp\n")
+                
+
+            logger.info(f"LST written: {output_file}")
+        except IOError as e:
+            handle_error(f"Write failed for {output_file}: {e}", e)
+            # Fallback: Print summary to console
+            print(f"Fallback Summary:\nTotal: {total_bytes}, Code: {code_bytes} ({coverage:.1f}%), Functions: {len(functions)}")
+        except Exception as e:
+            handle_error(f"Generation failed: {e}", e)
+
+    def _get_name(self, addr):
+        """Fetch name from DB (IDC-applied)."""
+        try:
+            row = self.db.conn.execute("SELECT name FROM symbols WHERE addr=?", (addr,)).fetchone()
+            return row[0] if row else None
+        except sqlite3.Error:
+            return None

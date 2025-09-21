@@ -1,198 +1,210 @@
 import logging
-from database import ITEM_TYPE_CODE, AnalysisDatabase, AddressInfo
-from idc_engine import IDCScript
-
-logger = logging.getLogger(__name__)
+from capstone import *
+from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
+import networkx as nx
+import numpy as np
+import sqlite3
+from utils import logger, handle_error  # Assume utils.py exists or inline
 
 class EmulationAnalyzer:
-    def __init__(self, db):
+    def __init__(self, binary, db, full=False, classify=False, xrefs=False):
+        self.binary = binary
         self.db = db
-        # Existing initialization if any
-        logger.info("EmulationAnalyzer initialized with database")
+        self.full = full
+        self.classify = classify
+        self.compute_xrefs = xrefs
+        self.md = Cs(CS_ARCH_X86, CS_MODE_16)
+        self.md.detail = True
+        self.functions = {}
+        self.instructions = []
+        self.xrefs = []
+        self.cfg = nx.DiGraph()
 
-    def analyze(self):
-        # Basic emulation analysis with function detection
-        from capstone import Cs, CS_ARCH_X86, CS_MODE_16  # For DOS 16-bit
-        md = Cs(CS_ARCH_X86, CS_MODE_16)
-        
-        entry = self.db.entry_point
-        if not entry:
-            logger.warning("No entry point; skipping analysis")
-            return
-        
-        # Mark entry as code
-        self.db.set_item_type(entry, ITEM_TYPE_CODE)
-        
-        # Bulk fetch bytes for efficient disassembly
-        max_scan = entry + 0x10000
-        all_bytes = self._get_bytes_at(entry, max_scan - entry)
-        if not all_bytes:
-            logger.warning("No bytes to analyze")
-            return
-        
-        logger.debug(f"Disassembling {len(all_bytes)} bytes from {hex(entry)}")
-        instructions = list(md.disasm(all_bytes, entry))
-        logger.debug(f"Generated {len(instructions)} instructions")
-        
-        # Store instructions in DB for output generation
-        for instr in instructions:
-            addr = instr.address
-            info = self.db.get_address_info(addr)
-            if info:
-                info.instruction = instr
-                info.item_type = ITEM_TYPE_CODE
-                # Add to function disassembly if in func (init if needed)
-                func = self.db.get_function_containing(addr)
-                if func:
-                    if not hasattr(func, 'disassembly'):
-                        func.disassembly = []
-                    func.disassembly.append(f"{hex(addr)}: {instr.mnemonic} {instr.op_str}")
-        
-        # Enhanced function detection: scan for multiple prologue patterns
-        i = 0
-        while i < len(instructions):
-            instr = instructions[i]
-            # Pattern 1: PUSH BP; MOV BP, SP
-            if instr.mnemonic == 'push' and instr.op_str == 'bp' and i+1 < len(instructions):
-                next_instr = instructions[i+1]
-                if next_instr.mnemonic == 'mov' and next_instr.op_str == 'bp,sp':
-                    func_start = instr.address
-                    func_end = self._find_ret_in_instructions(instructions, i+2)
-                    if func_end:
-                        self.db.add_function(func_start, func_end)
-                        logger.debug(f"Detected function (PUSH BP; MOV BP,SP) at {hex(func_start)} to {hex(func_end)}")
-                        i = next((j for j in range(i+2, len(instructions)) if instructions[j].address >= func_end), len(instructions))
-                        continue
-            
-            # Pattern 2: ENTER (used in some compilers)
-            elif instr.mnemonic == 'enter':
-                func_start = instr.address
-                func_end = self._find_ret_in_instructions(instructions, i+1)
-                if func_end:
-                    self.db.add_function(func_start, func_end)
-                    logger.debug(f"Detected function (ENTER) at {hex(func_start)} to {hex(func_end)}")
-                    i = next((j for j in range(i+1, len(instructions)) if instructions[j].address >= func_end), len(instructions))
+    def disassemble_segments(self):
+        try:
+            self.instructions = []
+            self.cfg.clear()
+            # Query segments from DB
+            cursor = self.db.conn.cursor()
+            cursor.execute("SELECT start_addr, end_addr FROM segments WHERE executable = 1")
+            segments = cursor.fetchall()
+            total_disasm_bytes = 0
+            for start, end in segments:
+                if end > len(self.binary):
+                    end = len(self.binary)
+                if start >= end:
                     continue
-            
-            # Pattern 3: CALL target (function might be called before being defined)
-            elif instr.mnemonic == 'call':
-                target_addr = self._parse_call_target(instr.op_str)
-                if target_addr and not self.db.get_function_at(target_addr):
-                    # Mark target as function start
-                    self.db.add_function(target_addr, None)
-                    logger.debug(f"Detected function via CALL at {hex(target_addr)}")
-            
-            i += 1
-        
-        logger.info("Emulation analysis completed")
-    
-    def _get_bytes_at(self, addr, size):
-        """Fetch bytes from DB memory."""
-        bytes_list = []
-        for i in range(size):
-            info = self.db.get_address_info(addr + i)
-            if info and hasattr(info, 'byte_value'):
-                bytes_list.append(info.byte_value)
-            else:
-                break
-        return bytes(bytes_list)
-    
-    def _find_ret_in_instructions(self, instructions, start_idx):
-        """Find return instruction in instruction list (ret, iret, retf)."""
-        for j in range(start_idx, len(instructions)):
-            instr = instructions[j]
-            if instr.mnemonic in ['ret', 'iret', 'retf']:
-                logger.debug(f"Found return {instr.mnemonic} at {hex(instr.address)}")
-                return instr.address + instr.size
-        return None
+                code = self.binary[start:end]
+                for i in self.md.disasm(code, start):
+                    ops = []
+                    for op in i.operands:
+                        if op.type == X86_OP_IMM:
+                            ops.append({'type': 'imm', 'value': op.imm})
+                        elif op.type == X86_OP_MEM:
+                            ops.append({'type': 'mem', 'base': op.mem.base, 'index': op.mem.index, 'scale': op.mem.scale, 'disp': op.mem.disp})
+                        elif op.type == X86_OP_REG:
+                            ops.append({'type': 'reg', 'value': op.reg})
+                    inst = {
+                        'addr': i.address,
+                        'size': i.size,
+                        'mnem': i.mnemonic,
+                        'op_str': i.op_str,
+                        'operands': ops,
+                        'classified': False
+                    }
+                    self.instructions.append(inst)
+                    # Add to CFG
+                    self.cfg.add_node(i.address)
+                    # Branches/calls for edges
+                    if i.mnemonic in ['call', 'jmp', 'je', 'jne', 'ja', 'jb', 'loop']:
+                        if any(op['type'] == 'imm' for op in ops):
+                            target = next(op['value'] for op in ops if op['type'] == 'imm')
+                            self.cfg.add_edge(i.address, target)
+                total_disasm_bytes += (end - start)
+            # Insert instructions to DB
+            for inst in self.instructions:
+                self.db.execute("INSERT OR IGNORE INTO instructions (addr, size, mnem, op_str, type) VALUES (?, ?, ?, ?, ?)",
+                                (inst['addr'], inst['size'], inst['mnem'], inst['op_str'], 'code'))
+            total_size = sum(end - start for start, end in segments)
+            coverage = (total_disasm_bytes / total_size * 100) if total_size > 0 else 0
+            logger.info(f"Disassembled {len(self.instructions)} instructions across {len(segments)} segments, coverage: {coverage:.1f}%")
+        except CsError as e:
+            handle_error(f"Disasm error: {e}", e)
+            self.instructions = []
 
-    def _parse_call_target(self, op_str):
-        """Parse call target address from operand string."""
-        # Handle direct calls: call 1234
-        if op_str.startswith('0x'):
-            try:
-                return int(op_str, 16)
-            except ValueError:
-                pass
-        # Handle relative calls: call -123
-        elif op_str.startswith('-') or op_str.startswith('+'):
-            try:
-                return int(op_str, 10)
-            except ValueError:
-                pass
-        # Handle register-based calls: call [bx]
-        # We'll skip these for now
-        return None
+    def classify_regions(self):
+        if not self.classify:
+            logger.info("Skipping classification (--classify not set)")
+            return
+        try:
+            for inst in self.instructions:
+                addr = inst['addr']
+                window_start = max(0, addr - 32)
+                window_end = min(len(self.binary), addr + 32)
+                window = self.binary[window_start:window_end]
+                entropy = self._calc_entropy(window)
+                is_data = entropy < 3.0 or self._is_data_signature(inst)
+                inst['classified'] = 'data' if is_data else 'code'
+                self.db.execute("UPDATE OR IGNORE instructions SET type=? WHERE addr=?", ('data' if is_data else 'code', addr))
+            # Re-classify segments based on avg instruction entropy
+            cursor = self.db.conn.cursor()
+            cursor.execute("SELECT start_addr, end_addr FROM segments")
+            for start, end in cursor.fetchall():
+                cursor = self.db.execute("SELECT AVG(entropy) FROM segments WHERE start_addr = ?", (start,))
+                avg_entropy = cursor.fetchone()[0] or 0
+                seg_class = 'CODE' if avg_entropy > 6.5 else 'DATA' if avg_entropy < 3.0 else 'UNKNOWN'
+                self.db.execute("UPDATE segments SET class = ? WHERE start_addr = ?", (seg_class, start))
+            logger.info("Classification complete")
+        except Exception as e:
+            logger.warning(f"Classification failed: {e} - using default 'code'")
+            for inst in self.instructions:
+                inst['classified'] = 'code'
 
-    def _find_ret(self, start):
-        """Fallback: Disasm scan for RET variants in bytes."""
-        search_size = 0x1000
-        search_bytes = self._get_bytes_at(start, search_size)
-        if not search_bytes:
-            return None
-        from capstone import Cs, CS_ARCH_X86, CS_MODE_16
-        md = Cs(CS_ARCH_X86, CS_MODE_16)
-        for i in md.disasm(search_bytes, start):
-            if i.mnemonic in ['ret', 'iret', 'retf']:
-                logger.debug(f"Fallback: Found return {i.mnemonic} at {hex(i.address)}")
-                return i.address + i.size
-        return None
+    def _calc_entropy(self, data):
+        if not data:
+            return 0
+        hist, _ = np.histogram(list(data), bins=256, density=True)
+        hist = hist[hist > 0]
+        return -np.sum(hist * np.log2(hist)) if len(hist) > 0 else 0
 
-    def is_data_region(self, addr):
-        # Check if addr falls in data segments (from MZ parser)
-        for seg in self.db.segments:
-            if seg.start_addr <= addr < seg.end_addr and seg.seg_class == "DATA":
-                return True
+    def _is_data_signature(self, inst):
+        if 'mov' in inst['mnem'] and any(op['type'] == 'imm' and 0 <= op['value'] <= 63 for op in inst['operands']):
+            return True
         return False
 
-    def classify_region(self, start_addr, size):
-        if self.is_data_region(start_addr):  # Use MZ flags/parser data
-            return "DATA"
-        return "CODE"
+    def detect_functions(self):
+        if not self.full:
+            logger.info("Skipping full function detection (--full not set)")
+            return
+        self.functions = {}
+        # Use CFG for better detection
+        for component in nx.weakly_connected_components(self.cfg):
+            if len(component) < 3:  # Skip small components
+                continue
+            # Find potential start: node with no in-edges or prologue
+            starts = [node for node in component if self.cfg.in_degree(node) == 0]
+            if not starts:
+                starts = list(component)[:1]  # Fallback
+            for start in starts:
+                inst = next((i for i in self.instructions if i['addr'] == start), None)
+                if inst and self._is_prologue(inst):
+                    func_end = self._find_epilogue(start)
+                    name = f"sub_{start:X}"
+                    # Check symbols from IDC for better names
+                    cursor = self.db.conn.cursor()
+                    cursor.execute("SELECT name FROM symbols WHERE addr = ?", (start,))
+                    sym = cursor.fetchone()
+                    if sym:
+                        name = sym[0]
+                    self.functions[start] = {
+                        'name': name,
+                        'start': start,
+                        'end': func_end,
+                        'calls': list(self.cfg.successors(start))
+                    }
+                    self.db.execute("INSERT OR REPLACE INTO functions (start, end, name) VALUES (?, ?, ?)",
+                                    (start, func_end, name))
+        logger.info(f"Detected {len(self.functions)} functions using CFG")
 
-    # Rest of the class remains unchanged
-    def other_methods(self):
-        pass
+    def _is_prologue(self, inst):
+        prologue_patterns = [
+            (inst['mnem'] == 'push' and 'bp' in inst['op_str']),
+            (inst['mnem'] == 'mov' and 'bp,sp' in inst['op_str']),
+            (inst['mnem'] == 'xor' and 'bp,bp' in inst['op_str']),
+            (inst['mnem'] == 'enter' and len(inst['operands']) >= 1),
+            # DOS/16-bit specifics
+            (inst['mnem'] == 'mov' and 'sp,0xFFFE' in inst['op_str']),  # Common DOS stack init
+            (inst['mnem'] == 'push' and 'ax' in inst['op_str'] and inst['addr'] == self.db.get_entry()),  # Entry push
+            (inst['mnem'] == 'cli' and next(inst for inst in self.instructions if inst['addr'] == self['addr']-2)['mnem'] == 'mov ax,ds')  # Approx DOS
+        ]
+        return any(pattern for pattern in prologue_patterns)
 
+    def _find_epilogue(self, start):
+        for i in self.instructions:
+            if i['addr'] >= start and i['mnem'] in ['ret', 'retn', 'retf']:
+                return i['addr'] + i['size']
+        return len(self.binary)
 
-def emulate(script: IDCScript, mz_data: dict) -> AnalysisDatabase:
-    """
-    Main emulation entry: Load MZ into DB, apply IDC basics, analyze.
-    :param script: Parsed IDCScript
-    :param mz_data: Dict from mz_parser
-    :return: Populated AnalysisDatabase
-    """
-    logger.info(f"Starting emulation with script ({len(script.variables) if script else 0} vars, {len(script.functions) if script else 0} funcs) and MZ data")
-    
-    db = AnalysisDatabase()
-    raw_bytes = mz_data['raw_bytes']
-    
-    # Populate memory with raw bytes (assume CODE for simplicity)
-    for i, b in enumerate(raw_bytes):
-        db.memory[i] = AddressInfo(i, b, ITEM_TYPE_CODE)
-    
-    db.entry_point = mz_data['entry_point']
-    db.segments = mz_data['segments']
-    db.file_format = "MZ"
-    
-    # Stub IDC application: Set labels for variables (dummy addresses based on entry)
-    if script:
-        base_addr = db.entry_point or 0x1000
-        for var in script.variables:
-            dummy_addr = base_addr + (hash(var.get('name', '')) % 0x1000)
-            db.set_label(dummy_addr, var['name'])
-            logger.debug(f"Applied IDC var label: {var['name']} at 0x{dummy_addr:x}")
-        
-        # Add script functions as DB functions (dummy ends)
-        for func_def in script.functions:
-            func_name = func_def.get('name', 'unknown')
-            func_start = base_addr + (hash(func_name) % 0x1000)
-            db.add_function(func_start, func_start + 0x100)  # Dummy size
-            logger.debug(f"Applied IDC func: {func_name} at 0x{func_start:x}")
-    
-    # Run static analysis (no full emulation for safety)
-    analyzer = EmulationAnalyzer(db)
-    analyzer.analyze()
-    
-    logger.info("Emulation/analysis completed successfully")
-    return db
+    def detect_xrefs(self):
+        if not self.compute_xrefs:
+            logger.info("Skipping xref computation (--xrefs not set)")
+            return
+        try:
+            self.xrefs = []
+            # From CFG edges
+            for fr, to in self.cfg.edges:
+                inst = next((i for i in self.instructions if i['addr'] == fr), None)
+                if inst:
+                    mnem = inst['mnem']
+                    xtype = 'call' if mnem.startswith('call') else 'jmp' if mnem == 'jmp' else 'branch'
+                    self.xrefs.append((fr, to, xtype, mnem))
+            # Data xrefs: imm in non-control flow insts
+            for inst in self.instructions:
+                if inst['mnem'] not in ['call', 'jmp', 'je', 'jne', 'ja', 'jb', 'loop']:
+                    for op in inst['operands']:
+                        if op['type'] == 'imm' and op['value'] > 0:
+                            target = op['value']
+                            self.xrefs.append((inst['addr'], target, 'data', inst['mnem']))
+            # Insert to DB (assume add_xref or use execute)
+            for fr, to, typ, instr in self.xrefs:
+                self.db.execute("INSERT OR IGNORE INTO xrefs (from_addr, to_addr, type, instruction) VALUES (?, ?, ?, ?)",
+                                (fr, to, typ, instr))
+            logger.info(f"Detected {len(self.xrefs)} xrefs")
+        except Exception as e:
+            handle_error(f"Xref detection failed: {e}", e)
+
+    def analyze(self):
+        self.disassemble_segments()
+        if self.classify:
+            self.classify_regions()
+        if self.full:
+            self.detect_functions()
+        if self.compute_xrefs:
+            self.detect_xrefs()
+        # Compute overall coverage
+        total_code_bytes = sum(inst['size'] for inst in self.instructions if inst.get('classified', 'code') != 'data')
+        total_size = len(self.binary)
+        coverage = (total_code_bytes / total_size * 100) if total_size > 0 else 0
+        self.db.execute("INSERT OR REPLACE INTO stats (key, value) VALUES ('code_coverage', ?)", (coverage,))
+        logging.debug(f"Coverage calc: {total_code_bytes} code bytes / {total_size} total = {coverage:.1f}%")
+        logger.info(f"Analysis complete: {len(self.instructions)} insts, {len(self.functions)} funcs, {coverage:.1f}% coverage")

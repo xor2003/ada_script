@@ -29,24 +29,16 @@ def test_parse_idc_function():
     """
 
     # Write to temp file for parse_idc
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.idc', delete=False) as f:
-        f.write(simple_idc)
-        temp_path = f.name
-
-    try:
-        result = parse_idc(temp_path)
-        assert result is not None
-        assert len(result.functions) == 1
-        assert result.functions[0]['name'] == 'main'
-        # Check the statement
-        assert len(result.functions[0]['statements']) == 1
-        stmt = result.functions[0]['statements'][0]
-        assert stmt.data == 'set_name_stmt'
-        assert stmt.children[0]['args'] == ['example', 'Test']
-    finally:
-        import os
-        os.unlink(temp_path)
+    result = parse_idc(simple_idc)
+    assert result is not None
+    assert len(result.functions) == 1
+    assert result.functions[0]['name'] == 'main'
+    # Check the statement
+    assert len(result.functions[0]['statements']) == 1
+    stmt = result.functions[0]['statements'][0]
+    assert stmt['type'] == 'call'
+    assert stmt['name'] == 'set_name'
+    assert stmt['args'] == ['example', 'Test']
 
 def test_keyword_handling():
     """Test parsing of known IDC keywords like 'static', 'include', etc."""
@@ -68,4 +60,4 @@ def test_syntax_error_on_incomplete_function():
     grammar = IDCGrammar()
     invalid_idc = "static my_func( {"
     with pytest.raises(SyntaxError):
-        grammar.parse(invalid_idc)
+        grammar.parse(invalid_idc, strict=True)
