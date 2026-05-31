@@ -224,6 +224,9 @@ class IDCTransformer(Transformer):
             script.variables.append(item)
         elif item_type == 'call':
             name = item.get('name', '')
+            if not hasattr(script, 'calls'):
+                script.calls = []
+            script.calls.append(item)
             if name == 'add_func':
                 script.functions.append(item)
             elif name == 'MakeStruct':
@@ -370,7 +373,7 @@ class IDCTransformer(Transformer):
     @v_args(inline=True)
     def command_stmt(self, name, lp, args, rp):
         import logging
-        logging.info(f"command_stmt name: {name}, args: {args}")
+        logging.debug(f"command_stmt name: {name}, args: {args}")
         result = {'type': 'call', 'name': name, 'args': args or []}
         logging.debug(f"Command parsed: {name}, args_len={len(result['args'])}")
         return result
@@ -399,7 +402,7 @@ class IDCTransformer(Transformer):
     @v_args(inline=True)
     def function_call(self, name, lp, args, rp):
         import logging
-        logging.info(f"function_call name: {name}, args: {args}")
+        logging.debug(f"function_call name: {name}, args: {args}")
         return {'type': 'call', 'name': name, 'args': args or []}
 
     def function_call_stmt(self, children):
@@ -675,7 +678,7 @@ class IDCTransformer(Transformer):
 
 
 class IDCScript:
-    def __init__(self, includes=None, defines=None, variables=None, functions=None, operands=None, comments=None, names=None, instructions=None, db=None):
+    def __init__(self, includes=None, defines=None, variables=None, functions=None, operands=None, comments=None, names=None, instructions=None, calls=None, db=None):
         self.includes = includes or []
         self.defines = defines or []
         self.variables = variables or []
@@ -684,7 +687,154 @@ class IDCScript:
         self.comments = comments or []
         self.names = names or {}
         self.instructions = instructions or []
+        self.calls = calls or []
         self.db = db
+
+    @staticmethod
+    def _token_value(value):
+        if isinstance(value, Token):
+            return value.value
+        return value
+
+    def _resolve_arg(self, arg):
+        arg = self._token_value(arg)
+        if isinstance(arg, dict) and arg.get('type') == 'assign':
+            return self._resolve_arg(arg.get('right'))
+        if isinstance(arg, str):
+            raw = arg.strip()
+            if raw.startswith(("0x", "0X")):
+                try:
+                    return int(raw, 16)
+                except ValueError:
+                    return raw
+            if raw.isdigit():
+                try:
+                    return int(raw, 10)
+                except ValueError:
+                    return raw
+            return raw
+        return arg
+
+    def _as_int(self, value):
+        value = self._resolve_arg(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            raw = value.strip()
+            base = 16 if raw.startswith(("0x", "0X")) else 10
+            try:
+                return int(raw, base)
+            except ValueError:
+                return None
+        return None
+
+    def _apply_call(self, call):
+        if self.db is None:
+            return
+        db = self.db
+        name = str(self._token_value(call.get('name', '')))
+        raw_args = call.get('args', []) or []
+        args = [self._resolve_arg(a) for a in raw_args]
+        name_l = name.lower()
+
+        # Database-wide reset from IDC bootstrap.
+        if name_l == "delete_all_segments":
+            db.execute("DELETE FROM segments")
+            return
+
+        # Segment creation / metadata.
+        if name_l == "add_segm_ex" and len(args) >= 2:
+            start = self._as_int(args[0])
+            end = self._as_int(args[1])
+            if start is None or end is None:
+                return
+            seg_type = "code"
+            executable = 0
+            if len(args) >= 6:
+                seg_kind = args[5]
+                if isinstance(seg_kind, int) and seg_kind == 2:
+                    seg_type = "code"
+                    executable = 1
+                elif isinstance(seg_kind, int) and seg_kind in (3, 5):
+                    seg_type = "data"
+            db.execute(
+                """
+                INSERT OR REPLACE INTO segments (start_addr, end_addr, class, type, executable, name)
+                VALUES (?, ?, COALESCE((SELECT class FROM segments WHERE start_addr=?), 'UNKNOWN'), ?, ?, COALESCE((SELECT name FROM segments WHERE start_addr=?), NULL))
+                """,
+                (start, end, start, seg_type, executable, start),
+            )
+            return
+        if name_l == "segrename" and len(args) >= 2:
+            start = self._as_int(args[0])
+            if start is None:
+                return
+            db.execute("UPDATE segments SET name=? WHERE start_addr=?", (str(args[1]), start))
+            return
+        if name_l == "segclass" and len(args) >= 2:
+            start = self._as_int(args[0])
+            if start is None:
+                return
+            db.execute("UPDATE segments SET class=? WHERE start_addr=?", (str(args[1]).upper(), start))
+            return
+
+        # Function / symbol / comments.
+        if name_l == "add_func" and len(args) >= 2:
+            start = self._as_int(args[0])
+            end = self._as_int(args[1])
+            if start is None or end is None:
+                return
+            db.execute(
+                "INSERT OR REPLACE INTO functions (start, end, name) VALUES (?, ?, COALESCE((SELECT name FROM functions WHERE start=?), ?))",
+                (start, end, start, f"sub_{start:X}"),
+            )
+            return
+        if name_l == "set_name" and len(args) >= 2:
+            addr = self._as_int(args[0])
+            if addr is None:
+                return
+            sym_name = str(args[1])
+            db.execute("INSERT OR REPLACE INTO symbols (addr, name) VALUES (?, ?)", (addr, sym_name))
+            db.execute("UPDATE functions SET name=? WHERE start=?", (sym_name, addr))
+            return
+        if name_l == "set_cmt" and len(args) >= 2:
+            addr = self._as_int(args[0])
+            if addr is None:
+                return
+            db.execute("INSERT OR REPLACE INTO comments (addr, comment) VALUES (?, ?)", (addr, str(args[1])))
+            return
+
+        # Instruction/data shaping.
+        if name_l == "create_insn" and len(args) >= 1:
+            addr = self._as_int(args[0])
+            if addr is None:
+                return
+            db.execute(
+                "INSERT OR IGNORE INTO instructions (addr, size, mnem, op_str, type) VALUES (?, ?, ?, ?, ?)",
+                (addr, 0, "", "", "code"),
+            )
+            return
+        if name_l in ("create_byte", "create_word", "create_dword") and len(args) >= 1:
+            addr = self._as_int(args[0])
+            if addr is None:
+                return
+            size = 1 if name_l == "create_byte" else 2 if name_l == "create_word" else 4
+            db.execute(
+                "INSERT OR REPLACE INTO instructions (addr, size, mnem, op_str, type) VALUES (?, ?, ?, ?, ?)",
+                (addr, size, "", "", "data"),
+            )
+            return
+
+        # Environment/config for reproducibility of script settings.
+        if name_l == "set_processor_type" and len(args) >= 1:
+            db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", ("processor_type", str(args[0])))
+            return
+        if name_l == "set_inf_attr" and len(args) >= 2:
+            db.execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                (f"inf_attr:{args[0]}", str(args[1])),
+            )
+            return
 
     def insert_to_db(self):
         if not self.db:
@@ -716,6 +866,9 @@ class IDCScript:
                 size = var.get('size', 0)
                 # Assume custom table or use symbols
                 self.db.execute("INSERT OR IGNORE INTO symbols (addr, name) VALUES (?, ?)", (0, f"struct_{name}_{size}"))
+        for call in self.calls:
+            if isinstance(call, dict) and call.get('type') == 'call':
+                self._apply_call(call)
         logging.info(f"IDC DB inserts: {len(self.functions)} funcs, {len(self.names)} names, {len(self.comments)} comments")
 
 
