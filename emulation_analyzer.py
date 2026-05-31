@@ -1,9 +1,8 @@
 import logging
-from capstone import *
+from capstone import CS_ARCH_X86, CS_MODE_16, Cs, CsError
 from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 import networkx as nx
 import numpy as np
-import sqlite3
 from utils import logger, handle_error  # Assume utils.py exists or inline
 
 class EmulationAnalyzer:
@@ -105,7 +104,12 @@ class EmulationAnalyzer:
             return 0
         hist, _ = np.histogram(list(data), bins=256, density=True)
         hist = hist[hist > 0]
-        return -np.sum(hist * np.log2(hist)) if len(hist) > 0 else 0
+        if len(hist) == 0:
+            return 0
+        entropy = 0.0
+        for p in hist.tolist():
+            entropy -= float(p) * float(np.log2(p))
+        return entropy
 
     def _is_data_signature(self, inst):
         if 'mov' in inst['mnem'] and any(op['type'] == 'imm' and 0 <= op['value'] <= 63 for op in inst['operands']):
@@ -155,7 +159,6 @@ class EmulationAnalyzer:
             # DOS/16-bit specifics
             (inst['mnem'] == 'mov' and 'sp,0xFFFE' in inst['op_str']),  # Common DOS stack init
             (inst['mnem'] == 'push' and 'ax' in inst['op_str'] and inst['addr'] == self.db.get_entry()),  # Entry push
-            (inst['mnem'] == 'cli' and next(inst for inst in self.instructions if inst['addr'] == self['addr']-2)['mnem'] == 'mov ax,ds')  # Approx DOS
         ]
         return any(pattern for pattern in prologue_patterns)
 

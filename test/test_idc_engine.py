@@ -124,7 +124,6 @@ def test_function_def_with_return():
 def test_multi_line_string_in_arg():
     """Test parsing multi-line strings with escapes in function args."""
     from idc_engine import parse_idc
-    from lark import Tree
     idc_content = '''
     static test_func() {
         set_cmt(0x100, "Multi\\nline\\nwith \\"quote\\"", 0);

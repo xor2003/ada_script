@@ -5,6 +5,7 @@ class Database:
     def __init__(self, path='analysis.db'):
         try:
             self.conn = sqlite3.connect(path)
+            self.binary = b""
             self._create_tables()
             logger.info(f"DB initialized: {path}")
         except sqlite3.Error as e:

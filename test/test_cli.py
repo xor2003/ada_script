@@ -32,9 +32,6 @@ def test_cli_basic_run():
 
 def test_cli_idc_failure():
     """Test that IDC parsing failure exits with non-zero code."""
-    import tempfile
-    import os
-
     # Create invalid IDC
     with tempfile.NamedTemporaryFile(suffix='.idc', delete=False) as f:
         f.write(b'invalid syntax here;')  # Causes Lark parse error

@@ -15,7 +15,6 @@ from mz_parser import MZParser
 from emulation_analyzer import EmulationAnalyzer
 from output_generator import OutputGenerator
 from database import Database
-import sqlite3  # For queries in report
 
 from idc_engine import parse_idc
 
@@ -130,7 +129,7 @@ def main():
 
         logging.info(f"Pipeline complete. MD: {args.output}, LST: {lst_file}, ASM: {asm_file}")
 
-    except Exception as e:
+    except Exception:
         logging.exception("Pipeline failed")
         sys.exit(1)
     finally:

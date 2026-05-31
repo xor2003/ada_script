@@ -1,6 +1,6 @@
 from lark import Lark, Transformer, v_args, Tree, Token
 from lark.exceptions import UnexpectedToken, UnexpectedCharacters
-import logging, sys
+import logging
 
 # Comprehensive IDC grammar: Covers commands from tests/egame.idc, full expressions in args, recursive statements.
 IDC_GRAMMAR = r"""
@@ -177,8 +177,9 @@ class IDCTransformer(Transformer):
                         script.includes.append(payload.strip())
                         processed += 1
                 elif isinstance(payload, Token):
-                    if payload.value.strip():
-                        script.includes.append(payload.value.strip())
+                    token_value = payload.value
+                    if token_value.strip():
+                        script.includes.append(token_value.strip())
                         processed += 1
                 elif isinstance(payload, dict):
                     self._add_item_to_script(script, payload)
@@ -191,9 +192,11 @@ class IDCTransformer(Transformer):
             elif isinstance(child, str) and child.strip():
                 script.includes.append(child.strip())
                 processed += 1
-            elif isinstance(child, Token) and child.value.strip():
-                script.includes.append(child.value.strip())
-                processed += 1
+            elif isinstance(child, Token):
+                token_value = child.value
+                if token_value.strip():
+                    script.includes.append(token_value.strip())
+                    processed += 1
             elif isinstance(child, dict):
                 self._add_item_to_script(script, child)
                 processed += 1
@@ -353,7 +356,12 @@ class IDCTransformer(Transformer):
 
     def _flatten_statements(self, tree):
         if isinstance(tree, Tree) and tree.data == 'statements':
-            return [self.transform(c) for c in tree.children if c and not (isinstance(c, Token) and c.type == 'NEWLINE')]
+            flattened = []
+            for child in tree.children:
+                if not child or (isinstance(child, Token) and child.type == 'NEWLINE'):
+                    continue
+                flattened.append(self.transform(child) if isinstance(child, Tree) else child)
+            return flattened
         elif isinstance(tree, list):
             return tree
         else:
@@ -369,7 +377,7 @@ class IDCTransformer(Transformer):
 
     @v_args(inline=True)
     def arg_list(self, *args):
-        return [a for a in args if a is not None]
+        return [a for a in args if a is not None and not (isinstance(a, Token) and a.type == 'COMMA')]
 
     @v_args(inline=True)
     def arg(self, *children):
@@ -408,15 +416,6 @@ class IDCTransformer(Transformer):
             left = {'type': 'assign', 'left': left, 'op': op, 'right': right}
             i += 2
         return left
-
-    @v_args(inline=True)
-    def arg(self, *children):
-        if len(children) == 3 and children[1] == '=':
-            return {'type': 'assign', 'left': children[0], 'op': '=', 'right': children[2]}
-        elif len(children) == 1:
-            return children[0]
-        else:
-            raise ValueError(f"Unexpected arg children: {children}")
 
     @v_args(inline=True)
     def bitwise_or(self, *children):
@@ -654,10 +653,6 @@ class IDCTransformer(Transformer):
     @v_args(inline=True)
     def GET_INF_ATTR(self, s): return s
 
-    def arg_list(self, children):
-        args = [c for c in children if c != ',']
-        return args
-
     def param_list(self, children):
         params = [self.transform(c) for c in children if c != ',']
         return params
@@ -747,12 +742,12 @@ class IDCGrammar:
                 raise SyntaxError("Parse resulted in empty script")
             return script
         except (UnexpectedToken, UnexpectedCharacters) as e:
-            logging.exception(f"Parse warning")
+            logging.exception("Parse warning")
             if strict:
                 raise SyntaxError(str(e)) from e
             return IDCScript()
         except Exception as e:
-            logging.exception(f"Parse error")
+            logging.exception("Parse error")
             if strict:
                 raise SyntaxError(str(e)) from e
             return IDCScript()
@@ -799,7 +794,8 @@ class IDCEngine:
         lines = content.splitlines()
         for line in lines:
             line = re.sub(r'\t', ' ', line.strip())
-            if not line: continue
+            if not line:
+                continue
             for cmd, pat in patterns.items():
                 match = pat.search(line)
                 if match:
