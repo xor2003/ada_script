@@ -111,14 +111,14 @@ _RM_DEST_OPS = frozenset((0x00, 0x01, 0x08, 0x09, 0x10, 0x11, 0x18, 0x19,
 
 # mnemonics capstone may emit that uasm cannot assemble at all
 _ASM_NO_MNEM = frozenset((
-    'int3', 'int1', 'salc', 'fcompi', 'fisttp', 'bswap',
+    'int3', 'int1', 'salc', 'fcompi', 'fisttp',
     # Katmai/Athlon additions beyond .686p MMX
     'pavgb', 'pavgw', 'pextrw', 'pinsrw', 'pmaxsw', 'pmaxub', 'pminsw',
     'pminub', 'pmovmskb', 'pmulhuw', 'psadbw', 'pshufw', 'sfence',
-    'maskmovq', 'movntq', 'femms', 'prefetchnta', 'prefetcht0',
-    'prefetcht1', 'prefetcht2',
+    'maskmovq', 'movntq', 'femms', 'prefetchw', 'prefetchnta',
+    'prefetcht0', 'prefetcht1', 'prefetcht2',
     # MMX insns uasm 2.57 lacks, MPX, CET and other oddballs
-    'psubq', 'prefetch', 'getsec', 'endbr32', 'endbr64',
+    'psubq', 'prefetch', 'getsec', 'endbr32', 'endbr64', 'bound',
     'bnd', 'bndcl', 'bndcn', 'bndcu', 'bndldx', 'bndmk', 'bndmov',
     'bndstx', 'nopw', 'nopd', 'notrack', 'pshufb',
     # SSE1/SSE2+ mnemonics uasm rejects at .686p (capstone groups are
@@ -903,6 +903,14 @@ class Analyzer:
         """`label[reg]` form for base/index+disp.  Returns text or None."""
         m = op.mem
         dsz = insn.encoding.disp_size if insn.encoding else 0
+        # capstone may report a 32-bit base/index for an encoding that
+        # carries no 67h prefix (misdecoded data) -- uasm would emit the
+        # override, changing the bytes
+        if insn.prefix[3] != 0x67 and (
+                (m.base and insn.reg_name(m.base)[:1] == 'e') or
+                (m.index and insn.reg_name(m.index)[:1] == 'e')):
+            inst['db_bytes'] = insn.bytes
+            return None
         lbl = decl_sz = None
         is_code = False
         if target is not None and target >= self.base:
@@ -939,10 +947,20 @@ class Analyzer:
                 ida_num(abs(m.disp))
             atxt = np + (segname or '') + f"[{num}]"
         elif self.seg_of(target) is not None:
-            # uasm needs an explicit seg on a label operand; a relocatable
-            # disp always encodes disp16, matching the original mod=10
-            aseg = segname or f"{seg}:"
-            atxt = ap + aseg + f"{lbl}[{inner}]"
+            tseg = self.seg_of(target)
+            dmask = 0xFFFFFFFF if insn.prefix[3] == 0x67 else 0xFFFF
+            if (target - tseg['start']) & dmask != m.disp & dmask:
+                # uasm would emit the label's offset in its own frame,
+                # which differs from the stored displacement -- numeric
+                num = inner + ('+' if m.disp >= 0 else '-') + \
+                    ida_num(abs(m.disp))
+                atxt = np + (segname or '') + f"[{num}]"
+            else:
+                # uasm needs an explicit seg on a label operand; a
+                # relocatable disp always encodes disp16, matching the
+                # original mod=10
+                aseg = segname or f"{seg}:"
+                atxt = ap + aseg + f"{lbl}[{inner}]"
         elif dsz == 2:
             # original used disp16 for a small/zero disp -- neither the
             # numeric form (minimized to disp8/mod00) nor a label is
@@ -997,7 +1015,18 @@ class Analyzer:
                         ida_num(m.disp & 0xFFFF)
                     inst['db_bytes'] = insn.bytes
                 elif self.seg_of(target) is not None:
-                    atxt = ap + (segname or f"{seg}:") + lbl
+                    tseg = self.seg_of(target)
+                    dmask = 0xFFFFFFFF if insn.prefix[3] == 0x67 \
+                        else 0xFFFF
+                    if (target - tseg['start']) & dmask != \
+                            m.disp & dmask:
+                        # label's offset in its own frame differs from
+                        # the stored displacement -- numeric
+                        atxt = np + (segname or '') + \
+                            f"[{ida_num(m.disp & 0xFFFF)}]"
+                        inst['db_bytes'] = insn.bytes
+                    else:
+                        atxt = ap + (segname or f"{seg}:") + lbl
                 else:
                     atxt = np + (segname or '') + \
                         f"[{ida_num(m.disp & 0xFFFF)}]"
@@ -1169,19 +1198,22 @@ class Analyzer:
                     lbl = f"{lbl}+{ida_num(d, True)}"
                 # 'str' size is the string length; the emitted element is db
                 return lbl, (1 if k == 'str' else sz), False
-        # labels not on a data item are emitted as `db` in the .asm; report
-        # size 1 so mismatched word/dword accesses get an explicit ptr
+        # labels not on a data item are emitted as `equ $+n`/`db` lines in
+        # the .asm; the generator types them by name prefix (word_ -> word
+        # ptr etc), so report that same size to size the access correctly
         if target in self.names or target in self.auto_names:
             code = target in self.funcs or target in self.covered
-            return self.label_at(target), 2 if code else 1, code
+            nm = self.label_at(target)
+            return nm, 2 if code else self._lbl_size(nm, target), code
         near = self._nearest_label_below(target)
         if near is not None:
             nm, off = near
             code = (target - off) in self.covered or \
                 (target - off) in self.funcs
             if off:
-                return f"{nm}+{ida_num(off, True)}", 2 if code else 1, code
-            return nm, 2 if code else 1, code
+                return f"{nm}+{ida_num(off, True)}", \
+                    2 if code else self._lbl_size(nm, target), code
+            return nm, 2 if code else self._lbl_size(nm, target), code
         return None, 0, False
 
     def _offset_expr(self, target):
@@ -1230,6 +1262,17 @@ class Analyzer:
 
     def _data_kind_for(self, size):
         return {1: 'byte', 2: 'word', 4: 'dword'}.get(size, 'byte')
+
+    def _lbl_size(self, nm, target):
+        """Size the generator will declare for a label: its name prefix
+        (byte_/word_/...) if any, else word for `equ` aliases past the
+        image end (uasm sizes untyped equs as words) and byte for `db`
+        gap lines."""
+        p = {'byte': 1, 'word': 2, 'dword': 4, 'qword': 8, 'fword': 6,
+             'tbyte': 10}.get(nm.split('_')[0])
+        if p:
+            return p
+        return 2 if target >= self.image_end else 1
 
     def _nearest_label_below(self, target):
         """Label for target inside a known data item (label+ofs form)."""
@@ -1304,6 +1347,11 @@ class Analyzer:
             reloc = any(r in self.reloc_words
                         for r in range(addr + 1, addr + insn.size))
             is_seg = bool(ovr and ovr[0] == 'seg') or reloc
+            if is_seg and getattr(op, 'size', 2) == 1:
+                # an imm8 can't carry a word-sized `seg` fixup; the reloc
+                # word runs into the next insn's bytes -- emit verbatim
+                inst['db_bytes'] = insn.bytes
+                return ida_num(val, True)
             if is_seg:
                 seg = self._seg_by_para(val + (self.base >> 4)) or \
                     self._seg_by_para(val)
@@ -1548,6 +1596,8 @@ class Analyzer:
                  bmnem not in _ASM_REPABLE) or \
                 pmnem == 'notrack' or \
                 (bmnem == 'nop' and ops) or \
+                (bmnem == 'bswap' and ops and (ops[0].type != X86_OP_REG or
+                 not insn.reg_name(ops[0].reg).startswith('e'))) or \
                 set(insn.groups) & _ASM_BAD_GROUPS or \
                 any(o.type == X86_OP_REG and
                     insn.reg_name(o.reg)[:3] in ('xmm', 'ymm', 'zmm')

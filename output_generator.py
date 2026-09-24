@@ -50,6 +50,19 @@ _NEAR_BRANCH = {
     'loopnz'}
 
 
+# element size implied by an auto-name prefix (byte_/word_/dword_/...)
+_PREFIX_SZ = {'byte': 1, 'word': 2, 'dword': 4, 'qword': 8,
+              'fword': 6, 'tbyte': 10}
+_DECL_SZ = {'db': 1, 'dw': 2, 'dd': 4, 'dq': 8, 'dt': 10, 'df': 6}
+_SZ_KW = {1: 'byte', 2: 'word', 4: 'dword', 8: 'qword',
+          6: 'fword', 10: 'tbyte'}
+# `equ $+n` aliases are typeless -- uasm sizes them as words, which
+# breaks byte-typed references.  Give them the type their prefix encodes.
+_EQU_TYPES = {'byte_': 'byte ptr', 'word_': 'word ptr',
+              'dword_': 'dword ptr', 'qword_': 'qword ptr',
+              'tbyte_': 'tbyte ptr', 'fword_': 'fword ptr'}
+
+
 def ida_num(value, force_hex=False):
     if value < 0:
         return '-' + ida_num(-value, force_hex)
@@ -172,16 +185,19 @@ class OutputGenerator:
             if not mnem or not (mnem[0] == 'j' or mnem in (
                     'loop', 'loope', 'loopne', 'jcxz', 'call')):
                 continue
-            op = ops.strip()
-            for kw in ('short ', 'near ptr ', 'far ptr '):
-                if op.startswith(kw):
-                    op = op[len(kw):]
-                    break
-            else:
-                if 'ptr' in op or '[' in op or ':' in op:
-                    continue  # indirect through a data cell, not a code target
-            if re.match(r'^[A-Za-z_?@$][\w?@$.]*$', op):
-                self.branch_lbls.add(op)
+            for op in (ops, _aops):
+                if not op:
+                    continue
+                op = op.strip()
+                for kw in ('short ', 'near ptr ', 'far ptr '):
+                    if op.startswith(kw):
+                        op = op[len(kw):]
+                        break
+                else:
+                    if 'ptr' in op or '[' in op or ':' in op:
+                        continue  # indirect via data cell, not a code target
+                if re.match(r'^[A-Za-z_?@$][\w?@$.]*$', op):
+                    self.branch_lbls.add(op)
 
         # sorted structural boundaries for gap/align detection
         self.bounds = sorted(set(self.funcs) | set(self.data_items)
@@ -731,7 +747,7 @@ class OutputGenerator:
                     # labels into the uninitialized tail are still
                     # referenced by stored offsets -- define them
                     lines.append(f"{p} {self._nf(label)} equ "
-                                 f"$+{ida_num(addr - self.img_hi)}")
+                                 f"{self._equ_expr(label, addr - self.img_hi, addr in self.funcs)}")
                 addr += 1
                 continue
             # item body
@@ -754,7 +770,7 @@ class OutputGenerator:
                     for la in sorted(mid):
                         lines.append(
                             f"{p} {self._nf(mid[la])} equ "
-                            f"$+{ida_num(la - addr)}")
+                            f"{self._equ_expr(mid[la], la - addr, la in self.funcs)}")
                 if asm and not dbh and size == 5:
                     raw = self._raw(addr, size)
                     if raw and raw[0] in (0x9A, 0xEA) and \
@@ -892,13 +908,18 @@ class OutputGenerator:
                     for la in sorted(mid):
                         lines.append(
                             f"{p} {self._nf(mid[la])} equ "
-                            f"$+{ida_num(la - addr)}")
+                            f"{self._equ_expr(mid[la], la - addr, la in self.funcs)}")
                 if asm and label in self.branch_lbls:
                     # jump target on a db item: uasm needs a code-typed
                     # label, so emit `name::` then the unlabeled data
                     lines.append(f"{p} {label}::")
                     label = None
                 body = self._data_body(addr, size, kind, count, p, asm=asm)
+                if label and asm:
+                    decl = self._decl_fix(label, body)
+                    if decl:
+                        lines.append(f"{p} {decl}")
+                        label = None
                 if label:
                     line = f"{p} {self._nf(label)}{body}"
                 else:
@@ -932,6 +953,11 @@ class OutputGenerator:
             if asm and label in self.branch_lbls:
                 lines.append(f"{p} {label}::")
                 label = None
+            if label and asm:
+                decl = self._decl_fix(label, 'db')
+                if decl:
+                    lines.append(f"{p} {decl}")
+                    label = None
             if label:
                 line = f"{p} {self._nf(label)}{self._byte_line(addr)}"
             else:
@@ -1157,9 +1183,32 @@ class OutputGenerator:
 
     _RE_386 = re.compile(
         r'\b(?:e[abcd]x|e[sb]p|e[sd]i|movsxd?|movzx|cdq|cwde|shld|shrd|'
-        r'bsf|bsr|bswap|cmpxchg|xadd|set\w+|cmov\w+|pushad|popad|lfs|lgs|'
+        r'bsf|bsr|set\w+|cmov\w+|pushad|popad|lfs|lgs|'
         r'lss|arpl|enter|leave|insd|outsd|lodsd|stosd|scasd|cmpsd|movsd|'
         r'iretd|jecxz)\b')
+    _RE_486 = re.compile(r'\b(?:invd|wbinvd|invlpg|cmpxchg|xadd|bswap)\b')
+    def _equ_expr(self, name, delta, is_code=False):
+        d = f"$+{ida_num(delta)}"
+        rn = getattr(self, '_lbl_rn', {})
+        if is_code or rn.get(name, name) in self.branch_lbls or \
+                name in self.branch_lbls or \
+                name.startswith(('loc_', 'sub_', 'start')):
+            return d
+        # uasm rejects `mov ds:EQU, r` when the equ is untyped -- always
+        # type data aliases (word matches uasm's own default for equs)
+        t = _EQU_TYPES.get(name.split('_')[0] + '_', 'word ptr')
+        return f"{t} ({d})"
+
+    def _decl_fix(self, name, body):
+        """`name label <type>` when the auto-name prefix (word_/byte_/...)
+        disagrees with the emitted directive -- otherwise uasm resolves
+        `seg:name` references at the directive's size, not the prefix's."""
+        want = _PREFIX_SZ.get(name.split('_')[0])
+        dsz = _DECL_SZ.get(body.strip().split()[0].lower())
+        if want and dsz and want != dsz:
+            return f"{self._nf(name)} label {_SZ_KW[want]}"
+        return None
+
     _RE_MMX = re.compile(
         r'\bmm[0-7]\b|\b(?:emms|movq|movd|padd|psub|pcmpeq|pcmpgt|packss|'
         r'packus|punpck|pmul|pmadd|psra|psrl|psll|por|pxor|pand|pandn)\w*\b|'
@@ -1167,15 +1216,19 @@ class OutputGenerator:
 
     def _cpu_level(self):
         """Minimum CPU directive for the decoded instruction set."""
-        is386 = mmx = False
+        is386 = is486 = mmx = False
         for _s, mnem, ops, _a, _d in self.insns.values():
             text = f"{mnem} {ops}"
             if self._RE_MMX.search(text):
                 mmx = True
+            elif self._RE_486.search(text):
+                is486 = True
             elif self._RE_386.search(text):
                 is386 = True
         if mmx:
             return ('.686p', True)
+        if is486:
+            return ('.486', False)
         return ('.386', False) if is386 else ('.286', False)
 
     def generate_asm(self, output_file='output.asm'):
