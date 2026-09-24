@@ -21,6 +21,7 @@ import bisect
 import hashlib
 import re
 import zlib
+
 from utils import logger
 
 # IDA attribute flag bits -> "Attributes:" words
@@ -81,6 +82,7 @@ class OutputGenerator:
         # bytes (alignment gaps, overlay tails) -- synthesize data segments
         # for them so the emitted image is complete
         img_end = self.db.image_base + self.db.image_size
+        self.img_hi = img_end
         if img_end and self.segments:
             gaps = []
             prev = self.db.image_base
@@ -721,6 +723,17 @@ class OutputGenerator:
                 # cross-proc self-modifying-code refs like `cs:loc_x+7`
                 lines.append(self._annotate(
                     f"{p} {label}{'::' if asm else ':'}", p, addr))
+            if asm and self.img_hi and addr >= self.img_hi:
+                # beyond the file's image the bytes are uninitialized --
+                # `db ?` still advances the segment (and uasm stores
+                # zeros for it), which would overshoot the original size
+                if label:
+                    # labels into the uninitialized tail are still
+                    # referenced by stored offsets -- define them
+                    lines.append(f"{p} {self._nf(label)} equ "
+                                 f"$+{ida_num(addr - self.img_hi)}")
+                addr += 1
+                continue
             # item body
             if is_code:
                 size, mnem, ops, aops, dbh = self.insns[addr]
@@ -728,10 +741,19 @@ class OutputGenerator:
                     # labels at mid-instruction addrs (e.g. SMC targets in
                     # `ds:loc_x+N` refs) never get a line -- define them as
                     # relocatable `equ $+delta` before the insn
-                    for la in sorted(lb for lb in self.labels
-                                     if addr < lb < addr + size):
+                    mid = {lb: self.labels[lb] for lb in self.labels
+                           if addr < lb < addr + size}
+                    # a function can start mid-insn too (an overlapping
+                    # decode seeded it as a call target)
+                    i = bisect.bisect_right(self.func_starts, addr)
+                    while i < len(self.func_starts) and \
+                            self.func_starts[i] < addr + size:
+                        lb = self.func_starts[i]
+                        mid.setdefault(lb, self.funcs[lb]['name'])
+                        i += 1
+                    for la in sorted(mid):
                         lines.append(
-                            f"{p} {self._nf(self.labels[la])} equ "
+                            f"{p} {self._nf(mid[la])} equ "
                             f"$+{ida_num(la - addr)}")
                 if asm and not dbh and size == 5:
                     raw = self._raw(addr, size)
@@ -779,7 +801,13 @@ class OutputGenerator:
                 else:
                     if asm and aops:
                         ops = aops
-                    text = mnem.ljust(8) + ops if ops else mnem
+                    if ops:
+                        # multiword mnemonics ('lock add', 'repne scasb')
+                        # exceed the 8-char field -- don't glue operands on
+                        text = (mnem.ljust(8) if len(mnem) < 8
+                                else mnem + ' ') + ops
+                    else:
+                        text = mnem
                     if asm:
                         text = self._chunk_seg_refs(text)
                         # a `seg X` operand on a relocated imm field: the
@@ -802,6 +830,28 @@ class OutputGenerator:
             if addr in self.data_items:
                 size, kind, count = self.data_items[addr]
                 span = size * max(count, 1)
+                if asm and self.img_hi and \
+                        addr < self.img_hi < addr + span:
+                    # item straddles the file's end -- emit only the
+                    # stored head, the tail is uninitialized
+                    raw = self._raw(addr, self.img_hi - addr) or b''
+                    for off in range(0, len(raw), 16):
+                        run = raw[off:off + 16]
+                        body = 'db ' + ','.join(
+                            ida_num(x) for x in run)
+                        la = addr + off
+                        lbl = self.labels.get(la)
+                        if off == 0 and label:
+                            lbl, label = label, None
+                        if lbl:
+                            lines.append(
+                                f"{p} {self._nf(lbl)}{body}")
+                        else:
+                            lines.append(
+                                f"{p}{' ' * max(1, 24 - len(p))}{body}")
+                    last_addr = addr
+                    addr = self.img_hi
+                    continue
                 if asm and chunk_i + 1 < len(chunks) and \
                         addr < chunks[chunk_i][2] < addr + span:
                     # a mandatory chunk boundary lands inside this item
@@ -831,10 +881,17 @@ class OutputGenerator:
                     # labels inside a multi-byte item never got their own
                     # line -- define them as relocatable `equ $+delta` so
                     # dw/ds: references resolve to the correct offset
-                    for la in sorted(lb for lb in self.labels
-                                     if addr < lb < addr + span):
+                    mid = {lb: self.labels[lb] for lb in self.labels
+                           if addr < lb < addr + span}
+                    i = bisect.bisect_right(self.func_starts, addr)
+                    while i < len(self.func_starts) and \
+                            self.func_starts[i] < addr + span:
+                        lb = self.func_starts[i]
+                        mid.setdefault(lb, self.funcs[lb]['name'])
+                        i += 1
+                    for la in sorted(mid):
                         lines.append(
-                            f"{p} {self._nf(self.labels[la])} equ "
+                            f"{p} {self._nf(mid[la])} equ "
                             f"$+{ida_num(la - addr)}")
                 if asm and label in self.branch_lbls:
                     # jump target on a db item: uasm needs a code-typed
@@ -1105,7 +1162,8 @@ class OutputGenerator:
         r'iretd|jecxz)\b')
     _RE_MMX = re.compile(
         r'\bmm[0-7]\b|\b(?:emms|movq|movd|padd|psub|pcmpeq|pcmpgt|packss|'
-        r'packus|punpck|pmul|pmadd|psra|psrl|psll|por|pxor|pand|pandn)\w*\b')
+        r'packus|punpck|pmul|pmadd|psra|psrl|psll|por|pxor|pand|pandn)\w*\b|'
+        r'\b(?:fcmov|fcomi|fucomi)\w*\b')
 
     def _cpu_level(self):
         """Minimum CPU directive for the decoded instruction set."""

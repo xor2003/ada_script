@@ -17,31 +17,74 @@ import bisect
 import logging
 import re
 
-from capstone import CS_ARCH_X86, CS_MODE_16, CS_AC_WRITE, Cs
-from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
+from capstone import CS_AC_WRITE, CS_ARCH_X86, CS_MODE_16, Cs
 from capstone.x86 import (
-    X86_REG_BP, X86_REG_SP, X86_REG_AX, X86_REG_AL,
-    X86_REG_BX, X86_REG_CX, X86_REG_DX,
-    X86_REG_SI, X86_REG_DI,
-    X86_REG_AH, X86_REG_BH, X86_REG_CH, X86_REG_DH,
-    X86_REG_CL, X86_REG_DL, X86_REG_BL,
-)
-from capstone.x86 import (
-    X86_REG_ES, X86_REG_CS, X86_REG_SS, X86_REG_DS,
-    X86_REG_FS, X86_REG_GS,
+    X86_OP_IMM,
+    X86_OP_MEM,
+    X86_OP_REG,
+    X86_REG_AH,
+    X86_REG_AL,
+    X86_REG_AX,
+    X86_REG_BH,
+    X86_REG_BL,
+    X86_REG_BP,
+    X86_REG_BX,
+    X86_REG_CH,
+    X86_REG_CL,
+    X86_REG_CS,
+    X86_REG_CX,
+    X86_REG_DH,
+    X86_REG_DI,
+    X86_REG_DL,
+    X86_REG_DS,
+    X86_REG_DX,
+    X86_REG_ES,
+    X86_REG_FS,
+    X86_REG_GS,
+    X86_REG_SI,
+    X86_REG_SP,
+    X86_REG_SS,
 )
 from capstone.x86_const import (
-    X86_INS_JMP, X86_INS_LJMP, X86_INS_CALL, X86_INS_LCALL,
-    X86_INS_RET, X86_INS_RETF, X86_INS_RETFQ,
-    X86_INS_LOOP, X86_INS_LOOPE, X86_INS_LOOPNE, X86_INS_JCXZ,
-    X86_INS_IRET, X86_INS_IRETD, X86_INS_HLT,
-    X86_INS_JAE, X86_INS_JB, X86_INS_JBE, X86_INS_JA,
-    X86_INS_JE, X86_INS_JNE, X86_INS_JS, X86_INS_JNS,
-    X86_INS_JO, X86_INS_JNO, X86_INS_JP, X86_INS_JNP,
-    X86_INS_JL, X86_INS_JLE, X86_INS_JGE, X86_INS_JG,
+    X86_INS_BOUND,
+    X86_INS_CALL,
+    X86_INS_HLT,
+    X86_INS_IRET,
+    X86_INS_IRETD,
+    X86_INS_JA,
+    X86_INS_JAE,
+    X86_INS_JB,
+    X86_INS_JBE,
+    X86_INS_JCXZ,
+    X86_INS_JE,
     X86_INS_JECXZ,
-    X86_INS_MOV, X86_INS_PUSH, X86_INS_POP, X86_INS_LEA, X86_INS_LES,
-    X86_INS_LDS, X86_INS_XCHG,
+    X86_INS_JG,
+    X86_INS_JGE,
+    X86_INS_JL,
+    X86_INS_JLE,
+    X86_INS_JMP,
+    X86_INS_JNE,
+    X86_INS_JNO,
+    X86_INS_JNP,
+    X86_INS_JNS,
+    X86_INS_JO,
+    X86_INS_JP,
+    X86_INS_JS,
+    X86_INS_LCALL,
+    X86_INS_LDS,
+    X86_INS_LEA,
+    X86_INS_LES,
+    X86_INS_LJMP,
+    X86_INS_LOOP,
+    X86_INS_LOOPE,
+    X86_INS_LOOPNE,
+    X86_INS_MOV,
+    X86_INS_POP,
+    X86_INS_PUSH,
+    X86_INS_RET,
+    X86_INS_RETF,
+    X86_INS_RETFQ,
+    X86_INS_XCHG,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,6 +106,31 @@ _REG_CODE = {
 _RM_DEST_OPS = frozenset((0x00, 0x01, 0x08, 0x09, 0x10, 0x11, 0x18, 0x19,
                           0x20, 0x21, 0x28, 0x29, 0x30, 0x31, 0x38, 0x39,
                           0x88, 0x89))
+
+# mnemonics capstone may emit that uasm cannot assemble at all
+_ASM_NO_MNEM = frozenset((
+    'int3', 'salc', 'fcompi', 'fisttp', 'bswap',
+    # Katmai/Athlon additions beyond .686p MMX
+    'pavgb', 'pavgw', 'pextrw', 'pinsrw', 'pmaxsw', 'pmaxub', 'pminsw',
+    'pminub', 'pmovmskb', 'pmulhuw', 'psadbw', 'pshufw', 'sfence',
+    'maskmovq', 'movntq', 'femms', 'prefetchnta', 'prefetcht0',
+    'prefetcht1', 'prefetcht2',
+    # privileged / long-mode insns
+    'syscall', 'sysenter', 'sysexit', 'sysret', 'swapgs', 'rdmsr',
+    'wrmsr', 'rdtsc', 'rdtscp', 'rdpmc', 'ud0', 'ud1', 'ud2',
+))
+
+# FPU arithmetic ops rendered by capstone as a single `st(n)` operand;
+# uasm requires the explicit two-register form -> keep original bytes
+_ASM_FPU_SINGLE = frozenset((
+    'fadd', 'fmul', 'fsub', 'fsubr', 'fdiv', 'fdivr',
+    'faddp', 'fmulp', 'fsubp', 'fsubrp', 'fdivp', 'fdivrp',
+))
+
+# operand-less mnemonics that legitimately carry a 66h/67h prefix
+_DWORD_MNEMS = frozenset((
+    'pushfd', 'popfd', 'iretd', 'pushad', 'popad',
+))
 
 JCC_IDS = {X86_INS_JAE, X86_INS_JB, X86_INS_JBE, X86_INS_JA, X86_INS_JE,
            X86_INS_JNE, X86_INS_JS, X86_INS_JNS, X86_INS_JO, X86_INS_JNO,
@@ -435,7 +503,13 @@ class Analyzer:
                     regions.append([b, nxt, None])
                     covered.append((b, nxt))
 
-        # 3) no structure at all -> recursive descent from entry point
+        # 3) the entry point is always code -- even when it sits inside a
+        # segment marked non-executable (real-mode images mix them)
+        if not any(s <= self.entry < e for s, e, _ in regions):
+            for r in self._recursive_descent():
+                if not in_covered(r[0]):
+                    regions.append(r)
+                    covered.append((r[0], r[1]))
         if not regions:
             regions = self._recursive_descent()
 
@@ -448,12 +522,15 @@ class Analyzer:
         regions = []
         visited = set()
         work = [entry]
+        entry_seg = self.seg_of(entry)
         while work:
             a = work.pop()
             if a in visited:
                 continue
             seg = self.seg_of(a)
-            if not seg or not seg['exec']:
+            if not seg or (not seg['exec'] and
+                           (entry_seg is None or
+                            seg['start'] != entry_seg['start'])):
                 continue
             visited.add(a)
             # linear sweep until a break in control flow
@@ -613,6 +690,11 @@ class Analyzer:
         # push/pop are inherently word-sized: IDA omits the ptr keyword
         if insn.id in (X86_INS_PUSH, X86_INS_POP):
             return False
+        # a shift/rotate count operand (cl or imm) is not the accessed
+        # data -- it never disambiguates the memory size
+        if insn.mnemonic.split()[-1] in SHIFT_IMPLICIT or \
+                insn.mnemonic.split()[-1] in ('shld', 'shrd'):
+            return True
         return not any(
             o.type == X86_OP_REG for j, o in enumerate(insn.operands)
             if j != opi)
@@ -860,6 +942,12 @@ class Analyzer:
         if insn.encoding and insn.encoding.disp_size == 2 and \
                 (base or index) and -128 <= m.disp <= 127:
             inst['db_bytes'] = insn.bytes
+        elif insn.encoding and insn.encoding.disp_size == 1 and \
+                m.disp == 0 and not (m.base == X86_REG_BP and not m.index):
+            # mod=01 disp8=0: capstone drops the "+0" and uasm
+            # re-encodes as mod=00 -- keep the original encoding.
+            # (only a lone [bp] still forces a disp8 on reassembly)
+            inst['db_bytes'] = insn.bytes
 
         if m.base == X86_REG_BP:
             return self._mem_bp(inst, insn, opi, op, segname, ptr_kw)
@@ -1063,7 +1151,7 @@ class Analyzer:
             return None
         a = self._lbl_sorted[i]
         if a in self.data_items:
-            sz, k, cnt = self.data_items[a]
+            sz, _k, cnt = self.data_items[a]
             if a + sz * max(cnt, 1) <= target:
                 return None
         elif target - a > 0x40:
@@ -1127,6 +1215,16 @@ class Analyzer:
             if is_seg:
                 seg = self._seg_by_para(val + (self.base >> 4)) or \
                     self._seg_by_para(val)
+                if seg is None and reloc:
+                    # the relocated word points at a paragraph that isn't
+                    # a declared segment base -- emit a `seg` reference to
+                    # the containing segment so the fixup stores the right
+                    # paragraph instead of a plain numeric
+                    rt = next((self.relocs[r] for r in
+                               range(addr + 1, addr + insn.size)
+                               if r in self.reloc_words), None)
+                    if rt:
+                        seg = self.seg_of(rt)
                 return f"seg {seg['name']}" if seg else \
                     ida_num(val + (self.base >> 4), True)
             # explicit offset override: op_plain_offset(ea, n, base)
@@ -1197,7 +1295,7 @@ class Analyzer:
             return True
         if target in self.auto_names:
             nm = self.auto_names[target]
-            return nm.startswith('a') or nm.startswith('asc_')
+            return nm.startswith(('a', 'asc_'))
         return False
 
     # opcodes for which uasm substitutes a shorter imm8 encoding when the
@@ -1239,6 +1337,95 @@ class Analyzer:
                             modrm != 0xC0 | (c0 << 3) | c1:
                         # uasm encodes operand 0 into the modrm reg field
                         inst['db_bytes'] = insn.bytes
+            if 'db_bytes' not in inst and lead + 1 < insn.size:
+                opc, modrm = insn.bytes[lead], insn.bytes[lead + 1]
+                regf = modrm & 0x38
+                if opc == 0xFF and modrm >= 0xC0 and \
+                        regf in (0x00, 0x08, 0x30) or \
+                        opc == 0x8F and modrm >= 0xC0 and regf == 0 or \
+                        opc in (0xC6, 0xC7) and modrm >= 0xC0 and \
+                        regf == 0 or \
+                        opc in (0xF6, 0xF7) and modrm >= 0xC0 and \
+                        regf in (0x00, 0x08):
+                    # uasm always picks the single-byte register form:
+                    # inc/dec/push reg -> 40+/48+/50+, pop reg -> 58+,
+                    # mov reg,imm -> B0+/B8+, test acc,imm -> A8/A9
+                    inst['db_bytes'] = insn.bytes
+                elif opc in (0x80, 0x81) and (modrm & 0xC7) == 0xC0:
+                    # group-1 with an accumulator r/m operand: uasm emits
+                    # the acc-imm opcodes (04/05/../3C/3D) or the 83h
+                    # sign-extended form instead
+                    inst['db_bytes'] = insn.bytes
+                elif opc in (0x88, 0x89, 0x8A, 0x8B) and \
+                        (modrm & 0xC7) == 0x06 and regf == 0:
+                    # mov al/ax <-> [disp16] is always emitted in the
+                    # moffs form (A0-A3), even for symbolic operands
+                    inst['db_bytes'] = insn.bytes
+                elif opc in (0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3) and \
+                        regf == 0x30:
+                    # the sal (/6) alias is emitted as shl (/4)
+                    inst['db_bytes'] = insn.bytes
+                elif opc in (0xF6, 0xF7) and modrm < 0xC0 and \
+                        regf == 0x08:
+                    # the test /1 memory alias is emitted as /0
+                    inst['db_bytes'] = insn.bytes
+            if 'db_bytes' not in inst and lead:
+                leadb = insn.bytes[:lead]
+                # a 66h/67h prefix only survives reassembly when the insn
+                # genuinely uses a 32-bit operand/address; a redundant one
+                # is silently dropped by uasm
+                if 0x66 in leadb and not (
+                        mnem.split()[-1] in _DWORD_MNEMS or any(
+                            o.type == X86_OP_REG and
+                            (insn.reg_name(o.reg) or '')[:1] == 'e' or
+                            o.type == X86_OP_MEM and o.size in (4, 6)
+                            for o in ops)):
+                    inst['db_bytes'] = insn.bytes
+                # a call/jmp through a 32-bit operand loses its 66h --
+                # uasm won't emit it for a control-flow instruction even
+                # when capstone renders `dword ptr`
+                if 'db_bytes' not in inst and 0x66 in leadb and \
+                        iid in (X86_INS_LCALL, X86_INS_LJMP,
+                                X86_INS_JMP, X86_INS_CALL) and \
+                        any(o.type == X86_OP_MEM for o in ops):
+                    inst['db_bytes'] = insn.bytes
+                if 'db_bytes' not in inst and 0x67 in leadb and (
+                        mnem.split()[-1] in _STRIP_BASES or not any(
+                            o.type == X86_OP_MEM and (
+                                (insn.reg_name(o.mem.base) or
+                                 '')[:1] == 'e' or
+                                (insn.reg_name(o.mem.index) or
+                                 '')[:1] == 'e')
+                            for o in ops)):
+                    # string ops render as a bare mnemonic -- the addr32
+                    # override has no asm form
+                    inst['db_bytes'] = insn.bytes
+                segb = [b for b in leadb if b in SEG_PREFIX]
+                if 'db_bytes' not in inst and len(segb) == 1:
+                    mems = [o.mem for o in ops if o.type == X86_OP_MEM]
+                    if mems:
+                        # uasm elides an override that matches the
+                        # operand's natural segment (ds, or ss for bp)
+                        dflt = 'ss' if any(
+                            m.base == X86_REG_BP
+                            for m in mems) else 'ds'
+                        if SEG_PREFIX[segb[0]] == dflt:
+                            inst['db_bytes'] = insn.bytes
+                    elif ops:
+                        # seg prefix on a non-memory insn has no asm form
+                        inst['db_bytes'] = insn.bytes
+        bmnem = mnem.split()[-1]
+        if bmnem in _ASM_NO_MNEM or \
+                (bmnem in _ASM_FPU_SINGLE and len(ops) == 1 and
+                 ops[0].type == X86_OP_REG) or \
+                (bmnem in ('aam', 'aad') and ops) or \
+                any(o.type == X86_OP_REG and
+                    insn.reg_name(o.reg)[:3] in ('xmm', 'ymm', 'zmm')
+                    for o in ops):
+            # uasm has no such mnemonic/operand form at any cpu level
+            # (misdecoded data, or an ISA extension beyond .686p) --
+            # keep the original bytes
+            inst['db_bytes'] = insn.bytes
         if enc is not None and enc.imm_size == 2 and ops and \
                 ops[-1].type == X86_OP_IMM and insn.bytes and \
                 insn.bytes[0] in self._IMM16_OPT_OPS:
@@ -1320,8 +1507,10 @@ class Analyzer:
                 inst['db_bytes'] = insn.bytes
             elif segp in SEG_PREFIX:
                 form = _STRSEG_FORMS.get(base)
-                if form is None or repp in (0xF0, 0xF2, 0xF3):
-                    # can't express the override in uasm syntax
+                if form is None or repp in (0xF0, 0xF2, 0xF3) or \
+                        segp == 0x3E:
+                    # can't express the override in uasm syntax, or it is
+                    # the ds-default source (uasm elides a redundant ds:)
                     inst['db_bytes'] = insn.bytes
                 else:
                     inst['asm_ops'] = form.format(seg=SEG_PREFIX[segp])
@@ -1336,6 +1525,12 @@ class Analyzer:
         if amap:
             inst['asm_ops'] = ', '.join(
                 amap.get(i, p) for i, p in enumerate(parts))
+        if iid == X86_INS_BOUND:
+            # uasm rejects an explicit size on bound's memory operand
+            # (it reads two words implicitly) -- drop the ptr keyword
+            atxt = inst.get('asm_ops') or ', '.join(parts)
+            inst['asm_ops'] = re.sub(
+                r'(?:dword|qword|fword|word|byte) ptr ', '', atxt)
         return ', '.join(parts)
 
     # ---------------------------------------------------------------- main
@@ -1371,7 +1566,7 @@ class Analyzer:
                 szs[off] = sz
                 spans.append((off, sz))
 
-            def covered(d):
+            def covered(d, spans=spans):
                 return any(o <= d < o + s for o, s in spans)
 
             # locals (negative disp), most negative first so a dword at -4

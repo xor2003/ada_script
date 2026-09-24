@@ -13,6 +13,10 @@ egame.lst
 egame_reference.lst
 egame_reference_.lst
 analysis.md
+*.obj
+*.BIN
+*.map
+*_rebuilt.exe
 dummy.exe
 dummy.idc
 idc
