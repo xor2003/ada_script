@@ -1,6 +1,7 @@
 from lark import Lark, Transformer, v_args, Tree, Token
 from lark.exceptions import UnexpectedToken, UnexpectedCharacters
 import logging
+import re
 
 # Comprehensive IDC grammar: Covers commands from tests/egame.idc, full expressions in args, recursive statements.
 IDC_GRAMMAR = r"""
@@ -214,6 +215,9 @@ class IDCTransformer(Transformer):
         logging.debug(f"Adding to script: type={item_type}, item={item}")
         if item_type == 'define':
             script.defines.append(item)
+            if not hasattr(script, 'calls'):
+                script.calls = []
+            script.calls.append(item)
         elif item_type == 'function':
             script.functions.append(item)
             # Recurse into statements to extract inner calls to top-level lists
@@ -222,11 +226,15 @@ class IDCTransformer(Transformer):
                     self._add_item_to_script(script, stmt)
         elif 'modifier' in item:
             script.variables.append(item)
-        elif item_type == 'call':
-            name = item.get('name', '')
+        elif item_type in ('call', 'assign'):
+            # Keep an ordered event stream: calls, assignments and defines are
+            # applied to the DB in source order (IDC semantics).
             if not hasattr(script, 'calls'):
                 script.calls = []
             script.calls.append(item)
+            if item_type == 'assign':
+                return
+            name = item.get('name', '')
             if name == 'add_func':
                 script.functions.append(item)
             elif name == 'MakeStruct':
@@ -251,8 +259,7 @@ class IDCTransformer(Transformer):
                 if not hasattr(script, 'operands'):
                     script.operands = []
                 script.operands.append(item)
-        # Removed unused: set_cmt/set_name handled in 'call' block now
-        elif item_type in ['return', 'assign']:
+        elif item_type == 'return':
             pass  # Ignore top-level in functions
 
     def statement(self, children):
@@ -689,6 +696,9 @@ class IDCScript:
         self.instructions = instructions or []
         self.calls = calls or []
         self.db = db
+        # IDC evaluation state (temporaries like `x`, `id`, defines).
+        self.env = {}
+        self.defines_map = {}
 
     @staticmethod
     def _token_value(value):
@@ -696,27 +706,140 @@ class IDCScript:
             return value.value
         return value
 
-    def _resolve_arg(self, arg):
-        arg = self._token_value(arg)
-        if isinstance(arg, dict) and arg.get('type') == 'assign':
-            return self._resolve_arg(arg.get('right'))
-        if isinstance(arg, str):
-            raw = arg.strip()
+    # Well-known IDC constants (values only need to be self-consistent).
+    _CONSTANTS = {
+        'E_PREV': 1000, 'E_NEXT': 2000,
+        'BADADDR': 0xFFFFFFFF,
+        'SN_LOCAL': 0x800, 'SN_CHECK': 0x1, 'SN_PUBLIC': 0x2, 'SN_WEAK': 0x4,
+        'FUNC_FAR': 0x2, 'FUNC_FRAME': 0x10, 'FUNC_USERFAR': 0x400,
+        'ADDSEG_NOSREG': 0x2000, 'ADDSEG_SPARSE': 0x8000, 'ADDSEG_OR_DIE': 1,
+        'SETPROC_USER': 2, 'SETPROC_COMPAT': 1, 'SETPROC_ALL': 0,
+        'UTP_ENUM': 0x4, 'UTP_STRUCT': 0x8,
+        'SCF_ALLCMT': 0x8,
+        'OFLG_SHOW_VOID': 0x2, 'OFLG_SHOW_AUTO': 0x40,
+        'INFFL_LOADIDC': 0x10,
+    }
+
+    def _eval(self, node):
+        """Evaluate an IDC expression tree to a Python value.
+
+        Returns int/str for concrete values, or the raw node when unknown.
+        Side-effect calls used inside expressions (add_enum, get_struc_id, ...)
+        are executed so that their return value can be tracked in env vars.
+        """
+        node = self._token_value(node)
+        if node is None:
+            return None
+        if isinstance(node, bool):
+            return int(node)
+        if isinstance(node, (int, float)):
+            return int(node)
+        if isinstance(node, str):
+            raw = node.strip()
+            if not raw:
+                return raw
+            # preprocessor defines alias other names (e.g. `#define id x`)
+            if raw in self.defines_map:
+                return self._eval(self.defines_map[raw])
+            if raw in self.env:
+                return self.env[raw]
+            if raw in self._CONSTANTS:
+                return self._CONSTANTS[raw]
             if raw.startswith(("0x", "0X")):
                 try:
                     return int(raw, 16)
                 except ValueError:
                     return raw
-            if raw.isdigit():
-                try:
-                    return int(raw, 10)
-                except ValueError:
-                    return raw
+            if raw.lstrip('-').isdigit():
+                return int(raw, 10)
             return raw
-        return arg
+        if isinstance(node, dict):
+            t = node.get('type')
+            if t == 'assign':
+                # two producer rules: arg -> left/right, assignment_stmt -> name/expr
+                val = self._eval(node.get('right', node.get('expr')))
+                key = str(self._token_value(node.get('left', node.get('name'))))
+                self.env[key] = val
+                return val
+            if t == 'binary':
+                lv = self._eval(node.get('left'))
+                r = self._eval(node.get('right'))
+                return self._apply_binop(node.get('op'), lv, r)
+            if t == 'unary':
+                v = self._eval(node.get('operand'))
+                if not isinstance(v, int):
+                    return 0
+                op = node.get('op')
+                return {'~': ~v, '!': int(not v), '-': -v, '+': v}.get(str(op), v)
+            if t == 'call':
+                return self._eval_call(node)
+            return node
+        if isinstance(node, list):
+            return [self._eval(n) for n in node]
+        return node
+
+    def _apply_binop(self, op, lv, r):
+        if not isinstance(lv, int) or not isinstance(r, int):
+            return 0
+        try:
+            return {
+                '|': lv | r, '&': lv & r, '+': lv + r, '-': lv - r, '*': lv * r,
+                '<<': lv << r, '>>': lv >> r,
+                '==': int(lv == r), '!=': int(lv != r),
+                '<': int(lv < r), '>': int(lv > r), '<=': int(lv <= r), '>=': int(lv >= r),
+                '/': int(lv / r) if r else 0, '%': lv % r if r else 0,
+            }.get(str(op), 0)
+        except Exception:
+            return 0
+
+    def _eval_call(self, node):
+        """Evaluate calls that appear inside expressions."""
+        name = str(self._token_value(node.get('name', '')))
+        args = [self._eval(a) for a in (node.get('args') or [])]
+        name_l = name.lower()
+        if name_l == 'get_inf_attr' and args:
+            row = self.db.conn.execute(
+                "SELECT value FROM config WHERE key=?", (f"inf_attr:{args[0]}",)).fetchone() \
+                if self.db is not None else None
+            try:
+                return int(row[0]) if row else 0
+            except (ValueError, TypeError):
+                return 0
+        if name_l in ('getenum', 'get_enum') and args:
+            return self._enum_id(str(args[0]))
+        if name_l == 'get_struc_id' and args:
+            return self._struc_id(str(args[0]))
+        if name_l == 'get_member_id' and len(args) >= 2:
+            return f"mid:{args[0]}:{args[1]}"
+        if self.db is not None:
+            # Side-effect builtins used inside expressions (add_enum,
+            # add_struc_member, ...): apply them and use their return value.
+            return self._apply_named(name, args)
+        return 0
+
+    def _enum_id(self, name):
+        if self.db is None:
+            return 0
+        row = self.db.conn.execute("SELECT id FROM enums WHERE name=?", (name,)).fetchone()
+        if row:
+            return row[0]
+        cur = self.db.execute("INSERT INTO enums (name) VALUES (?)", (name,))
+        return cur.lastrowid or 0
+
+    def _struc_id(self, name):
+        if self.db is None:
+            return 0
+        row = self.db.conn.execute("SELECT id FROM strucs WHERE name=?", (name,)).fetchone()
+        if row:
+            return row[0]
+        cur = self.db.execute("INSERT INTO strucs (name) VALUES (?)", (name,))
+        return cur.lastrowid or 0
+
+    def _resolve_arg(self, arg):
+        return self._eval(arg)
 
     def _as_int(self, value):
-        value = self._resolve_arg(value)
+        value = self._eval(value)
         if isinstance(value, int):
             return value
         if isinstance(value, str):
@@ -728,148 +851,445 @@ class IDCScript:
                 return None
         return None
 
+    def _int_args(self, args, n):
+        out = []
+        for a in args[:n]:
+            v = self._as_int(a)
+            if v is None:
+                return None
+            out.append(v)
+        return out
+
+    def _apply_named(self, name, args):
+        """Handle a builtin call with already-evaluated args."""
+        handler = self._IDC_CMDS.get(name.lower())
+        if handler is not None:
+            return handler(self, args)
+        # Everything else (add_default_til, type-updating, unknown user calls)
+        # is intentionally ignored.
+        return None
+
+    # ---- segments -----------------------------------------------------
+    def _cmd_delete_all_segments(self, args):
+        db = self.db
+        db.execute("DELETE FROM segments")
+        db.execute("DELETE FROM sregs")
+        db.execute("DELETE FROM sreg_ranges")
+
+    def _cmd_add_segm_ex(self, args):
+        if len(args) < 3:
+            return
+        start, end = self._as_int(args[0]), self._as_int(args[1])
+        base = self._as_int(args[2]) or 0
+        align = self._as_int(args[4]) if len(args) > 4 else 1
+        comb = self._as_int(args[5]) if len(args) > 5 else 2
+        align = 1 if align is None else align
+        comb = 2 if comb is None else comb
+        if start is None or end is None:
+            return
+        self.db.execute(
+            "INSERT OR REPLACE INTO segments (start_addr, end_addr, base, class, type, executable, align, comb, name) "
+            "VALUES (?, ?, ?, COALESCE((SELECT class FROM segments WHERE start_addr=?), 'UNKNOWN'), "
+            "COALESCE((SELECT type FROM segments WHERE start_addr=?), 'code'), "
+            "COALESCE((SELECT executable FROM segments WHERE start_addr=?), 0), ?, ?, "
+            "COALESCE((SELECT name FROM segments WHERE start_addr=?), NULL))",
+            (start, end, base, start, start, start, align, comb, start))
+
+    def _cmd_segrename(self, args):
+        if len(args) < 2:
+            return
+        start = self._as_int(args[0])
+        if start is not None:
+            self.db.execute("UPDATE segments SET name=? WHERE start_addr=?",
+                            (str(args[1]), start))
+
+    def _cmd_segclass(self, args):
+        if len(args) < 2:
+            return
+        start = self._as_int(args[0])
+        if start is None:
+            return
+        cls = str(args[1]).upper()
+        self.db.execute("UPDATE segments SET class=? WHERE start_addr=?", (cls, start))
+        if cls == 'CODE':
+            self.db.execute("UPDATE segments SET type='code', executable=1 WHERE start_addr=?",
+                            (start,))
+        elif cls in ('DATA', 'STACK'):
+            self.db.execute("UPDATE segments SET type=?, executable=0 WHERE start_addr=?",
+                            ('stack' if cls == 'STACK' else 'data', start))
+
+    def _cmd_segdefreg(self, args):
+        if len(args) < 3:
+            return
+        start = self._as_int(args[0])
+        val = self._as_int(args[2])
+        if start is not None and val is not None:
+            self.db.execute("INSERT OR REPLACE INTO sregs (seg_start, reg, value) VALUES (?, ?, ?)",
+                            (start, str(args[1]).lower(), val))
+
+    def _cmd_set_segm_type(self, args):
+        if len(args) < 2:
+            return
+        start, t = self._as_int(args[0]), self._as_int(args[1])
+        if start is None or t is None:
+            return
+        # SEG_CODE=2, SEG_DATA=3, SEG_BSS=6, SEG_STACK=9
+        cls = {2: ('CODE', 'code', 1), 3: ('DATA', 'data', 0),
+               6: ('DATA', 'data', 0), 9: ('STACK', 'stack', 0)}.get(t)
+        if cls:
+            self.db.execute("UPDATE segments SET class=?, type=?, executable=? WHERE start_addr=?",
+                            (cls[0], cls[1], cls[2], start))
+
+    def _cmd_split_sreg_range(self, args):
+        if len(args) < 3:
+            return
+        ea = self._as_int(args[0])
+        val = self._as_int(args[2])
+        if ea is not None and val is not None:
+            if val in (0xFFFFFFFF, -1, 0xFFFFFFFFFFFFFFFF):
+                val = -1  # unknown sreg value
+            self.db.execute("INSERT OR REPLACE INTO sreg_ranges (start_addr, end_addr, reg, value) "
+                            "VALUES (?, ?, ?, ?)", (ea, -1, str(args[1]).lower(), val))
+
+    # ---- items (code/data boundaries) ---------------------------------
+    def _cmd_create_insn(self, args):
+        if not args:
+            return
+        ea = self._as_int(args[0])
+        if ea is not None:
+            self.db.execute("INSERT OR IGNORE INTO code_seeds (addr) VALUES (?)", (ea,))
+            self.db.execute("DELETE FROM data_items WHERE addr=?", (ea,))
+
+    _ITEM_SIZES = {'create_byte': 1, 'create_word': 2, 'create_dword': 4, 'create_qword': 8}
+
+    def _cmd_create_item(self, args, name_l):
+        if not args:
+            return
+        ea = self._as_int(args[0])
+        if ea is None:
+            return
+        size = self._ITEM_SIZES[name_l]
+        self.db.execute("INSERT OR REPLACE INTO data_items (addr, size, kind, count) "
+                        "VALUES (?, ?, ?, 1)",
+                        (ea, size, {1: 'byte', 2: 'word', 4: 'dword', 8: 'qword'}[size]))
+        self.db.execute("DELETE FROM code_seeds WHERE addr=?", (ea,))
+
+    def _cmd_create_byte(self, args):
+        self._cmd_create_item(args, 'create_byte')
+
+    def _cmd_create_word(self, args):
+        self._cmd_create_item(args, 'create_word')
+
+    def _cmd_create_dword(self, args):
+        self._cmd_create_item(args, 'create_dword')
+
+    def _cmd_create_qword(self, args):
+        self._cmd_create_item(args, 'create_qword')
+
+    def _cmd_make_array(self, args):
+        if len(args) < 2:
+            return
+        ea, count = self._as_int(args[0]), self._as_int(args[1])
+        if ea is not None and count:
+            row = self.db.conn.execute("SELECT kind FROM data_items WHERE addr=?",
+                                       (ea,)).fetchone()
+            if row:
+                self.db.execute("UPDATE data_items SET count=? WHERE addr=?", (count, ea))
+            else:
+                self.db.execute("INSERT OR REPLACE INTO data_items (addr, size, kind, count) "
+                                "VALUES (?, 1, 'byte', ?)", (ea, count))
+
+    def _cmd_create_strlit(self, args):
+        if not args:
+            return
+        ea = self._as_int(args[0])
+        length = self._as_int(args[1]) if len(args) > 1 else 0
+        if ea is not None:
+            self.db.execute("INSERT OR REPLACE INTO data_items (addr, size, kind, count) "
+                            "VALUES (?, ?, 'str', 1)", (ea, length or 1))
+
+    def _cmd_makestruct(self, args):
+        if len(args) < 2:
+            return
+        ea = self._as_int(args[0])
+        if ea is not None:
+            sid = self._struc_id(str(args[1]))
+            size = self.db.conn.execute(
+                "SELECT COALESCE(MAX(offset+size), 1) FROM struc_members WHERE struc_id=?",
+                (sid,)).fetchone()[0]
+            self.db.execute("INSERT OR REPLACE INTO data_items (addr, size, kind, count) "
+                            "VALUES (?, ?, ?, 1)", (ea, size, f"struct:{args[1]}"))
+
+    # ---- names / comments / functions ---------------------------------
+    def _cmd_set_name(self, args):
+        if len(args) < 2:
+            return
+        ea = self._as_int(args[0])
+        if ea is None:
+            return
+        sym = str(args[1])
+        if not sym:
+            self.db.execute("DELETE FROM symbols WHERE addr=?", (ea,))
+            return
+        self.db.execute(
+            "INSERT OR REPLACE INTO symbols (addr, name, auto, kind) VALUES (?, ?, 0, 'name')",
+            (ea, sym))
+        self.db.execute("UPDATE functions SET name=? WHERE start=?", (sym, ea))
+
+    def _cmd_set_cmt(self, args):
+        if len(args) < 2:
+            return
+        ea = self._as_int(args[0])
+        if ea is not None:
+            rep = self._as_int(args[2]) if len(args) > 2 else 0
+            self.db.execute(
+                "INSERT OR REPLACE INTO comments (addr, comment, repeatable) VALUES (?, ?, ?)",
+                (ea, str(args[1]), rep or 0))
+
+    def _cmd_set_func_cmt(self, args):
+        if len(args) < 2:
+            return
+        ea = self._as_int(args[0])
+        if ea is not None:
+            # anterior comment on the proc line
+            self.db.execute("INSERT OR REPLACE INTO extra_comments (addr, line, comment) "
+                            "VALUES (?, 500, ?)", (ea, str(args[1])))
+
+    def _cmd_update_extra_cmt(self, args):
+        if len(args) < 3:
+            return
+        ea = self._as_int(args[0])
+        line = self._as_int(args[1])
+        if ea is not None and line is not None:
+            self.db.execute("INSERT OR REPLACE INTO extra_comments (addr, line, comment) "
+                            "VALUES (?, ?, ?)", (ea, line, str(args[2])))
+
+    def _cmd_add_func(self, args):
+        if len(args) < 2:
+            return
+        start, end = self._as_int(args[0]), self._as_int(args[1])
+        if start is None:
+            return
+        if end is None or end <= start or end > 0xFFFFFFFF:
+            end = start
+        self.db.execute(
+            "INSERT INTO functions (start, end, name) VALUES (?, ?, "
+            "COALESCE((SELECT name FROM functions WHERE start=?), "
+            "(SELECT name FROM symbols WHERE addr=?), ?)) "
+            "ON CONFLICT(start) DO UPDATE SET end=excluded.end",
+            (start, end, start, start, f"sub_{start:X}"))
+        self.db.execute("INSERT OR IGNORE INTO code_seeds (addr) VALUES (?)", (start,))
+
+    def _cmd_set_func_flags(self, args):
+        if len(args) < 2:
+            return
+        start, flags = self._as_int(args[0]), self._as_int(args[1])
+        if start is not None and flags is not None:
+            self.db.execute("UPDATE functions SET flags=? WHERE start=?", (flags, start))
+
+    def _cmd_set_frame_size(self, args):
+        if len(args) < 4:
+            return
+        vals = self._int_args(args, 4)
+        if vals:
+            self.db.execute("INSERT OR REPLACE INTO frames (func_start, frsize, frregs, argsize) "
+                            "VALUES (?, ?, ?, ?)", tuple(vals))
+
+    def _cmd_define_local_var(self, args):
+        if len(args) < 4:
+            return
+        fstart = self._as_int(args[0])
+        loc, vname = str(args[2]), str(args[3])
+        m = re.search(r'\[bp([+-]\s*0[xX][0-9A-Fa-f]+|[+-]\s*\d+)\]', loc)
+        if fstart is not None and m:
+            off = int(m.group(1).replace(' ', ''), 0)
+            self.db.execute("INSERT OR REPLACE INTO frame_vars (func_start, offset, name) "
+                            "VALUES (?, ?, ?)", (fstart, off, vname))
+
+    # ---- operand formatting -------------------------------------------
+    def _cmd_op_hex(self, args):
+        if len(args) >= 2:
+            self._add_op_override(args[0], args[1], 'hex')
+
+    def _cmd_op_dec(self, args):
+        if len(args) >= 2:
+            self._add_op_override(args[0], args[1], 'dec')
+
+    def _cmd_op_char(self, args):
+        if len(args) >= 2:
+            self._add_op_override(args[0], args[1], 'char')
+
+    def _cmd_op_seg(self, args):
+        if len(args) >= 2:
+            self._add_op_override(args[0], args[1], 'seg')
+
+    def _cmd_op_stkvar(self, args):
+        if len(args) >= 2:
+            self._add_op_override(args[0], args[1], 'stkvar')
+
+    def _cmd_op_plain_offset(self, args):
+        if len(args) >= 3:
+            self._add_op_override(args[0], args[1], 'offset', self._as_int(args[2]) or 0)
+
+    def _cmd_op_offset(self, args):
+        if len(args) >= 3:
+            self._add_op_override(args[0], args[1], 'offset', self._as_int(args[2]) or 0)
+
+    def _cmd_op_enum(self, args):
+        if len(args) >= 3:
+            enum_id = args[2] if isinstance(args[2], int) else 0
+            self._add_op_override(args[0], args[1], 'enum', enum_id)
+
+    def _cmd_op_stroff(self, args):
+        if len(args) >= 3:
+            sid = self._struc_id(str(args[2])) if not isinstance(args[2], int) else args[2]
+            self._add_op_override(args[0], args[1], 'struct', sid)
+
+    # ---- enums / structures -------------------------------------------
+    def _cmd_add_enum(self, args):
+        if len(args) >= 2:
+            return self._enum_id(str(args[1]))
+        return None
+
+    def _cmd_add_enum_member(self, args):
+        if len(args) < 3:
+            return
+        eid = self._as_int(args[0])
+        val = self._as_int(args[2])
+        if eid is not None and val is not None:
+            self.db.execute("INSERT OR REPLACE INTO enum_members (enum_id, name, value) "
+                            "VALUES (?, ?, ?)", (eid, str(args[1]), val))
+
+    def _cmd_add_struc(self, args):
+        if len(args) >= 2:
+            return self._struc_id(str(args[1]))
+        return None
+
+    def _cmd_add_struc_member(self, args):
+        if len(args) < 3:
+            return
+        sid = self._as_int(args[0])
+        off = self._as_int(args[2])
+        nbytes = self._as_int(args[5]) if len(args) > 5 else 1
+        if sid is not None and off is not None:
+            self.db.execute("INSERT OR REPLACE INTO struc_members (struc_id, name, offset, size) "
+                            "VALUES (?, ?, ?, ?)", (sid, str(args[1]), off, nbytes or 1))
+
+    def _cmd_settype(self, args):
+        if len(args) < 2:
+            return
+        target = args[0]
+        if isinstance(target, str) and target.startswith('mid:'):
+            return  # member type info: not rendered
+        ea = self._as_int(target)
+        if ea is not None:
+            self.db.execute("INSERT OR REPLACE INTO extra_comments (addr, line, comment) "
+                            "VALUES (?, -1, ?)", (ea, f"; {args[1]}"))
+
+    # ---- config --------------------------------------------------------
+    def _cmd_set_processor_type(self, args):
+        if args:
+            self.db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                            ("processor_type", str(args[0])))
+
+    def _cmd_set_inf_attr(self, args):
+        if len(args) < 2:
+            return
+        self.db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                        (f"inf_attr:{args[0]}", str(args[1])))
+        if str(args[0]) == 'INF_HIGH_OFF':
+            v = self._as_int(args[1])
+            if v:
+                self.db.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('image_end', ?)",
+                                (str(v),))
+
+    def _cmd_set_flag(self, args):
+        if len(args) >= 3:
+            self.db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                            (f"flag:{args[0]}", str(args[2])))
+
+    _IDC_CMDS = {
+        'delete_all_segments': _cmd_delete_all_segments,
+        'add_segm_ex': _cmd_add_segm_ex,
+        'segrename': _cmd_segrename,
+        'segclass': _cmd_segclass,
+        'segdefreg': _cmd_segdefreg,
+        'set_segm_type': _cmd_set_segm_type,
+        'split_sreg_range': _cmd_split_sreg_range,
+        'create_insn': _cmd_create_insn,
+        'create_byte': _cmd_create_byte,
+        'create_word': _cmd_create_word,
+        'create_dword': _cmd_create_dword,
+        'create_qword': _cmd_create_qword,
+        'make_array': _cmd_make_array,
+        'create_strlit': _cmd_create_strlit,
+        'makestruct': _cmd_makestruct,
+        'set_name': _cmd_set_name,
+        'set_cmt': _cmd_set_cmt,
+        'set_func_cmt': _cmd_set_func_cmt,
+        'update_extra_cmt': _cmd_update_extra_cmt,
+        'add_func': _cmd_add_func,
+        'set_func_flags': _cmd_set_func_flags,
+        'set_frame_size': _cmd_set_frame_size,
+        'define_local_var': _cmd_define_local_var,
+        'op_hex': _cmd_op_hex,
+        'op_dec': _cmd_op_dec,
+        'op_char': _cmd_op_char,
+        'op_seg': _cmd_op_seg,
+        'op_stkvar': _cmd_op_stkvar,
+        'op_plain_offset': _cmd_op_plain_offset,
+        'op_offset': _cmd_op_offset,
+        'op_enum': _cmd_op_enum,
+        'op_stroff': _cmd_op_stroff,
+        'add_enum': _cmd_add_enum,
+        'add_enum_member': _cmd_add_enum_member,
+        'add_struc': _cmd_add_struc,
+        'add_struc_member': _cmd_add_struc_member,
+        'settype': _cmd_settype,
+        'set_processor_type': _cmd_set_processor_type,
+        'set_inf_attr': _cmd_set_inf_attr,
+        'set_flag': _cmd_set_flag,
+    }
+
+    def _add_op_override(self, ea_arg, n_arg, kind, arg=0):
+        ea, n = self._as_int(ea_arg), self._as_int(n_arg)
+        if ea is None or n is None:
+            return
+        self.db.execute(
+            "INSERT OR REPLACE INTO op_overrides (addr, opnum, kind, arg, arg2) VALUES (?, ?, ?, ?, ?)",
+            (ea, n & 0x7F, kind, arg, n & 0x80))
+
     def _apply_call(self, call):
         if self.db is None:
             return
-        db = self.db
         name = str(self._token_value(call.get('name', '')))
-        raw_args = call.get('args', []) or []
-        args = [self._resolve_arg(a) for a in raw_args]
-        name_l = name.lower()
+        args = [self._eval(a) for a in (call.get('args') or [])]
+        self._apply_named(name, args)
 
-        # Database-wide reset from IDC bootstrap.
-        if name_l == "delete_all_segments":
-            db.execute("DELETE FROM segments")
-            return
-
-        # Segment creation / metadata.
-        if name_l == "add_segm_ex" and len(args) >= 2:
-            start = self._as_int(args[0])
-            end = self._as_int(args[1])
-            if start is None or end is None:
-                return
-            seg_type = "code"
-            executable = 0
-            if len(args) >= 6:
-                seg_kind = args[5]
-                if isinstance(seg_kind, int) and seg_kind == 2:
-                    seg_type = "code"
-                    executable = 1
-                elif isinstance(seg_kind, int) and seg_kind in (3, 5):
-                    seg_type = "data"
-            db.execute(
-                """
-                INSERT OR REPLACE INTO segments (start_addr, end_addr, class, type, executable, name)
-                VALUES (?, ?, COALESCE((SELECT class FROM segments WHERE start_addr=?), 'UNKNOWN'), ?, ?, COALESCE((SELECT name FROM segments WHERE start_addr=?), NULL))
-                """,
-                (start, end, start, seg_type, executable, start),
-            )
-            return
-        if name_l == "segrename" and len(args) >= 2:
-            start = self._as_int(args[0])
-            if start is None:
-                return
-            db.execute("UPDATE segments SET name=? WHERE start_addr=?", (str(args[1]), start))
-            return
-        if name_l == "segclass" and len(args) >= 2:
-            start = self._as_int(args[0])
-            if start is None:
-                return
-            db.execute("UPDATE segments SET class=? WHERE start_addr=?", (str(args[1]).upper(), start))
-            return
-
-        # Function / symbol / comments.
-        if name_l == "add_func" and len(args) >= 2:
-            start = self._as_int(args[0])
-            end = self._as_int(args[1])
-            if start is None or end is None:
-                return
-            db.execute(
-                "INSERT OR REPLACE INTO functions (start, end, name) VALUES (?, ?, COALESCE((SELECT name FROM functions WHERE start=?), ?))",
-                (start, end, start, f"sub_{start:X}"),
-            )
-            return
-        if name_l == "set_name" and len(args) >= 2:
-            addr = self._as_int(args[0])
-            if addr is None:
-                return
-            sym_name = str(args[1])
-            db.execute("INSERT OR REPLACE INTO symbols (addr, name) VALUES (?, ?)", (addr, sym_name))
-            db.execute("UPDATE functions SET name=? WHERE start=?", (sym_name, addr))
-            return
-        if name_l == "set_cmt" and len(args) >= 2:
-            addr = self._as_int(args[0])
-            if addr is None:
-                return
-            db.execute("INSERT OR REPLACE INTO comments (addr, comment) VALUES (?, ?)", (addr, str(args[1])))
-            return
-
-        # Instruction/data shaping.
-        if name_l == "create_insn" and len(args) >= 1:
-            addr = self._as_int(args[0])
-            if addr is None:
-                return
-            db.execute(
-                "INSERT OR IGNORE INTO instructions (addr, size, mnem, op_str, type) VALUES (?, ?, ?, ?, ?)",
-                (addr, 0, "", "", "code"),
-            )
-            return
-        if name_l in ("create_byte", "create_word", "create_dword") and len(args) >= 1:
-            addr = self._as_int(args[0])
-            if addr is None:
-                return
-            size = 1 if name_l == "create_byte" else 2 if name_l == "create_word" else 4
-            db.execute(
-                "INSERT OR REPLACE INTO instructions (addr, size, mnem, op_str, type) VALUES (?, ?, ?, ?, ?)",
-                (addr, size, "", "", "data"),
-            )
-            return
-
-        # Environment/config for reproducibility of script settings.
-        if name_l == "set_processor_type" and len(args) >= 1:
-            db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", ("processor_type", str(args[0])))
-            return
-        if name_l == "set_inf_attr" and len(args) >= 2:
-            db.execute(
-                "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-                (f"inf_attr:{args[0]}", str(args[1])),
-            )
-            return
+    def _apply_event(self, ev):
+        t = ev.get('type')
+        if t == 'call':
+            self._apply_call(ev)
+        elif t == 'assign':
+            key = str(self._token_value(ev.get('left', ev.get('name'))))
+            self.env[key] = self._eval(ev.get('right', ev.get('expr')))
+        elif t == 'define':
+            name = str(self._token_value(ev.get('name', '')))
+            self.defines_map[name] = ev.get('value')
 
     def insert_to_db(self):
         if not self.db:
             return
-        # Insert functions (use name if available, else sub_addr)
-        for func in self.functions:
-            start = func.get('start', 0)
-            end = func.get('end', 0)
-            name = func.get('name', f"sub_{start:X}")
-            self.db.execute("INSERT OR REPLACE INTO functions (start, end, name) VALUES (?, ?, ?)", (start, end, name))
-        # Insert symbols/names
-        for addr, name in self.names.items():
-            self.db.execute("INSERT OR REPLACE INTO symbols (addr, name) VALUES (?, ?)", (addr, name))
-            # Update functions if matches start
-            self.db.execute("UPDATE functions SET name = ? WHERE start = ?", (name, addr))
-        # Insert comments
-        for cmt in self.comments:
-            addr = cmt.get('addr', 0)
-            text = cmt.get('text', '')
-            self.db.execute("INSERT OR REPLACE INTO comments (addr, comment) VALUES (?, ?)", (addr, text))
-        # Insert instructions from create_insn
-        for insn in self.instructions:
-            addr = insn.get('addr', 0)
-            self.db.execute("INSERT OR IGNORE INTO instructions (addr, size, mnem, op_str, type) VALUES (?, ?, ?, ?, ?)", (addr, 0, '', '', 'code'))  # Stub size/mnem
-        # Structs as variables if MakeStruct-like
-        for var in self.variables:
-            if var.get('type') == 'struct':
-                name = var.get('name', '')
-                size = var.get('size', 0)
-                # Assume custom table or use symbols
-                self.db.execute("INSERT OR IGNORE INTO symbols (addr, name) VALUES (?, ?)", (0, f"struct_{name}_{size}"))
-        for call in self.calls:
-            if isinstance(call, dict) and call.get('type') == 'call':
-                self._apply_call(call)
-        logging.info(f"IDC DB inserts: {len(self.functions)} funcs, {len(self.names)} names, {len(self.comments)} comments")
+        # Process the ordered event stream (calls/assigns/defines) so that
+        # variables such as `x`/`id` behave like real IDC temporaries.
+        for ev in self.calls:
+            if isinstance(ev, dict):
+                self._apply_event(ev)
+        # A set_name() may precede the matching add_func(): propagate names.
+        self.db.execute("UPDATE functions SET name=(SELECT name FROM symbols WHERE addr=start) "
+                        "WHERE EXISTS (SELECT 1 FROM symbols WHERE addr=start AND auto=0)")
+        logging.info(f"IDC DB inserts: {len(self.functions)} funcs, {len(self.names)} names, "
+                     f"{len(self.comments)} comments, {len(self.calls)} events")
 
 
     def __repr__(self):

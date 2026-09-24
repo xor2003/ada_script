@@ -1,130 +1,129 @@
 import struct
-from database import Database
 from collections import Counter
-import math
+from database import Database
 from utils import handle_error
 
+# Linear base address at which IDA loads an MZ load module (1000h:0000).
+LOAD_BASE = 0x10000
+
+
 class MZParser:
+    """Parses an MZ/EXE header and seeds the analysis database.
+
+    Address model used across the whole project: every address is a *linear*
+    address where the first byte of the load image is mapped at 0x10000.
+    file_offset(addr) = header_size + (addr - LOAD_BASE).
+    """
+
     def __init__(self, binary):
         self.binary = binary
+        self.header = {}
+        self.image_size = 0
+        self.header_size = 0
+        self.entry_addr = 0
+        self.relocs = []  # list of (linear_addr_of_word, pointed_seg_base_linear)
 
     def parse(self):
         try:
-            if len(self.binary) < 64 or self.binary[:2] != b'MZ':
+            if len(self.binary) < 28 or self.binary[:2] != b'MZ':
                 raise ValueError("Invalid MZ/EXE signature or file too short")
 
-            # Full MZ header parsing
-            header = {}
-            header['pages'] = struct.unpack('<H', self.binary[2:4])[0]
-            header['logical_pages'] = struct.unpack('<H', self.binary[4:6])[0]
-            header['num_relocs'] = struct.unpack('<H', self.binary[6:8])[0]
-            header['header_paras'] = struct.unpack('<H', self.binary[8:10])[0]
-            header['min_paras'] = struct.unpack('<H', self.binary[10:12])[0]
-            header['max_paras'] = struct.unpack('<H', self.binary[12:14])[0]
-            header['ss'] = struct.unpack('<H', self.binary[14:16])[0]
-            header['sp'] = struct.unpack('<H', self.binary[16:18])[0]
-            header['csum'] = struct.unpack('<H', self.binary[18:20])[0]
-            header['ip'] = struct.unpack('<H', self.binary[20:22])[0]
-            header['cs'] = struct.unpack('<H', self.binary[22:24])[0]
-            header['reloc_offset'] = struct.unpack('<H', self.binary[24:26])[0]
-            header['overlay_num'] = struct.unpack('<H', self.binary[26:28])[0]
-            header['filler'] = self.binary[28:32]  # 4 bytes
-            header['min_alloc'] = struct.unpack('<H', self.binary[32:34])[0]
-            header['max_alloc'] = struct.unpack('<H', self.binary[34:36])[0]
-            header['ssx'] = struct.unpack('<H', self.binary[36:38])[0]
-            header['spx'] = struct.unpack('<H', self.binary[38:40])[0]
-            header['cx'] = struct.unpack('<H', self.binary[40:42])[0]
-            header['ipx'] = struct.unpack('<H', self.binary[42:44])[0]
-            header['max_stack'] = struct.unpack('<H', self.binary[44:46])[0]
-            header['checksum'] = struct.unpack('<H', self.binary[46:48])[0]
-            header['oem_id'] = struct.unpack('<H', self.binary[48:50])[0]
-            header['oem_info'] = struct.unpack('<H', self.binary[50:52])[0]
-            header['res1'] = self.binary[52:64]  # 12 bytes reserved
+            b = self.binary
+            h = self.header
+            h['last_page_bytes'] = struct.unpack('<H', b[2:4])[0]   # e_cp
+            h['pages'] = struct.unpack('<H', b[4:6])[0]              # e_cpage
+            h['num_relocs'] = struct.unpack('<H', b[6:8])[0]         # e_crlc
+            h['header_paras'] = struct.unpack('<H', b[8:10])[0]      # e_cparhdr
+            h['min_paras'] = struct.unpack('<H', b[10:12])[0]
+            h['max_paras'] = struct.unpack('<H', b[12:14])[0]
+            h['ss'] = struct.unpack('<H', b[14:16])[0]
+            h['sp'] = struct.unpack('<H', b[16:18])[0]
+            h['csum'] = struct.unpack('<H', b[18:20])[0]
+            h['ip'] = struct.unpack('<H', b[20:22])[0]
+            h['cs'] = struct.unpack('<H', b[22:24])[0]
+            h['reloc_offset'] = struct.unpack('<H', b[24:26])[0]
+            h['overlay_num'] = struct.unpack('<H', b[26:28])[0]
 
-            header_size = header['header_paras'] * 16
-            image_size = header['pages'] * 512 - header_size
-            if image_size > len(self.binary):
-                image_size = len(self.binary)
+            self.header_size = h['header_paras'] * 16
+            last = h['last_page_bytes'] or 512
+            self.image_size = (h['pages'] - 1) * 512 + last - self.header_size
+            if self.image_size <= 0:
+                self.image_size = len(b) - self.header_size
+            # image may not extend past EOF
+            self.image_size = min(self.image_size, len(b) - self.header_size)
+            image_end = LOAD_BASE + self.image_size
 
-            # Entry point calculation
-            entry_seg = header['cs']
-            entry_off = header['ip']
-            entry_addr = (entry_seg << 4) + entry_off
+            self.entry_addr = LOAD_BASE + (h['cs'] << 4) + h['ip']
 
-            # Create DB
-            db = Database('analysis.db')
+            db = Database('analysis.db', fresh=True)
+            db.image_base = LOAD_BASE
+            db.header_size = self.header_size
+            db.image_size = self.image_size
 
-            # Parse relocation table if present
-            reloc_start = header['reloc_offset']
-            reloc_end = reloc_start + (header['num_relocs'] * 2)
+            for key, val in (
+                ('load_base', LOAD_BASE), ('header_size', self.header_size),
+                ('image_size', self.image_size), ('image_end', image_end),
+                ('entry_addr', self.entry_addr),
+                ('ss', h['ss']), ('sp', h['sp']), ('cs', h['cs']), ('ip', h['ip']),
+            ):
+                db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                           (key, str(val)))
+
+            # Relocation table: each entry is a far pointer (off:seg) to a word
+            # inside the image holding a segment value relative to image start.
+            reloc_start = h['reloc_offset']
             relocs = []
-            if reloc_start > 0 and reloc_end <= len(self.binary):
-                for i in range(header['num_relocs']):
-                    offset = struct.unpack('<H', self.binary[reloc_start + i*2 : reloc_start + i*2 + 2])[0]
-                    relocs.append(offset)
-                for reloc in relocs:
-                    db.execute("INSERT INTO relocations (addr, offset) VALUES (?, ?)",
-                               ((entry_seg << 4) + reloc, reloc))
+            for i in range(h['num_relocs']):
+                off = reloc_start + i * 4
+                if off + 4 > len(b):
+                    break
+                roff, rseg = struct.unpack('<HH', b[off:off + 4])
+                loc = LOAD_BASE + (rseg << 4) + roff
+                fo = loc - LOAD_BASE + self.header_size
+                pointed = None
+                if 0 <= fo + 2 <= len(b):
+                    pointed = LOAD_BASE + (struct.unpack('<H', b[fo:fo + 2])[0] << 4)
+                relocs.append((loc, pointed))
+                db.execute("INSERT INTO relocations (addr, offset) VALUES (?, ?)",
+                           (loc, pointed if pointed is not None else 0))
+            self.relocs = relocs
 
-            # Define segments based on MZ structure
-            # Code segment starting at entry or 0x10000 typical for EXE
-            code_start = max(0x10000, entry_addr & 0xF0000)  # Align to segment
-            code_end = code_start + image_size // 2  # Approximate
-            db.execute("INSERT INTO segments (start_addr, end_addr, class, type) VALUES (?, ?, ?, ?)",
-                       (code_start, code_end, 'CODE', 'code'))
+            # Default segments (IDC may delete and recreate them).
+            # CODE: whole load image.  STACK: from ss:sp.
+            db.execute(
+                "INSERT INTO segments (start_addr, end_addr, base, class, type, executable, name) "
+                "VALUES (?, ?, ?, 'CODE', 'code', 1, 'seg000')",
+                (LOAD_BASE, image_end, LOAD_BASE >> 4))
+            stack_start = LOAD_BASE + (h['ss'] << 4)
+            stack_end = stack_start + (h['sp'] or 0x1000)
+            db.execute(
+                "INSERT INTO segments (start_addr, end_addr, base, class, type, executable, name) "
+                "VALUES (?, ?, ?, 'STACK', 'stack', 0, 'seg_stack')",
+                (stack_start, stack_end, (h['ss'] + 0x1000) & 0xFFFF))
 
-            # Data segment (after code or from overlay)
-            data_start = code_end
-            data_end = data_start + 0x10000  # Approximate data
+            # Guess the default data segment from relocation targets: the most
+            # common segment paragraph pointed to by relocations is the DGROUP.
+            seg_votes = Counter(p for _, p in relocs if p)
+            if seg_votes:
+                dseg_base, _cnt = seg_votes.most_common(1)[0]
+                db.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('default_ds', ?)",
+                           (str(dseg_base >> 4),))
+                if dseg_base > LOAD_BASE and dseg_base < stack_start:
+                    db.execute(
+                        "INSERT INTO segments (start_addr, end_addr, base, class, type, executable, name) "
+                        "VALUES (?, ?, ?, 'DATA', 'data', 0, 'dseg')",
+                        (dseg_base, stack_start, dseg_base >> 4))
+                    if dseg_base < image_end:
+                        db.execute("UPDATE segments SET end_addr=? WHERE start_addr=? AND type='code'",
+                                   (dseg_base, LOAD_BASE))
 
-            # Classify segments using entropy
-            def compute_entropy(start, end):
-                if end - start > len(self.binary):
-                    return 0
-                data = self.binary[start:end]
-                if len(data) == 0:
-                    return 0
-                counts = Counter(data)
-                if not counts:
-                    return 0
-                probs = [count / len(data) for count in counts.values()]
-                entropy = -sum(p * math.log2(p) for p in probs if p > 0)
-                return entropy
+            db.execute("INSERT OR REPLACE INTO symbols (addr, name) VALUES (?, ?)",
+                       (self.entry_addr, 'start'))
 
-            # Classify code segment
-            code_entropy = compute_entropy(code_start, min(code_end, len(self.binary)))
-            code_class = 'CODE' if code_entropy > 6.5 else 'DATA' if code_entropy < 3.0 else 'UNKNOWN'
-            db.execute("INSERT OR REPLACE INTO segments (start_addr, end_addr, class, type, entropy) VALUES (?, ?, ?, ?, ?)",
-                       (code_start, code_end, code_class, 'code', code_entropy))
-
-            # Classify data segment
-            data_entropy = compute_entropy(data_start, min(data_end, len(self.binary)))
-            data_class = 'DATA' if data_entropy < 3.0 else 'CODE' if data_entropy > 6.5 else 'UNKNOWN'
-            db.execute("INSERT OR REPLACE INTO segments (start_addr, end_addr, class, type, entropy) VALUES (?, ?, ?, ?, ?)",
-                       (data_start, data_end, data_class, 'data', data_entropy))
-
-            # Stack segment (from header ss/sp)
-            stack_start = (header['ss'] << 4)
-            stack_end = stack_start + (header['sp'] or 0x1000)
-            db.execute("INSERT INTO segments (start_addr, end_addr, class, type) VALUES (?, ?, ?, ?)",
-                       (stack_start, stack_end, 'STACK', 'stack'))
-
-            # Re-classify stack if needed
-            stack_entropy = compute_entropy(stack_start, min(stack_end, len(self.binary)))
-            stack_class = 'STACK' if stack_entropy < 2.0 else 'DATA'
-            db.execute("UPDATE segments SET class = ?, entropy = ? WHERE start_addr = ?",
-                       (stack_class, stack_entropy, stack_start))
-
-            # Insert entry point as symbol
-            db.execute("INSERT INTO symbols (addr, name) VALUES (?, ?)", (entry_addr, 'start'))
-
-            # Mark executable based on class
-            db.execute("UPDATE segments SET executable = 1 WHERE class IN ('CODE', 'EXEC')")
-            db.execute("UPDATE segments SET executable = 0 WHERE class IN ('DATA', 'STACK', 'UNKNOWN')")
-
-            print(f"MZ parsing complete: entry at {hex(entry_addr)}, {header['num_relocs']} relocs, segments added")
+            print(f"MZ parsing complete: entry at {self.entry_addr:#x}, "
+                  f"{h['num_relocs']} relocs, image {self.image_size:#x} bytes")
             return db
-        
+
         except struct.error as e:
             handle_error(f"MZ unpack error (invalid binary format): {e}", e)
             raise ValueError("Failed to parse MZ header - possibly corrupted or non-MZ file")

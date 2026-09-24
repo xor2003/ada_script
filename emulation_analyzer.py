@@ -85,14 +85,6 @@ class EmulationAnalyzer:
                 is_data = entropy < 3.0 or self._is_data_signature(inst)
                 inst['classified'] = 'data' if is_data else 'code'
                 self.db.execute("UPDATE OR IGNORE instructions SET type=? WHERE addr=?", ('data' if is_data else 'code', addr))
-            # Re-classify segments based on avg instruction entropy
-            cursor = self.db.conn.cursor()
-            cursor.execute("SELECT start_addr, end_addr FROM segments")
-            for start, end in cursor.fetchall():
-                cursor = self.db.execute("SELECT AVG(entropy) FROM segments WHERE start_addr = ?", (start,))
-                avg_entropy = cursor.fetchone()[0] or 0
-                seg_class = 'CODE' if avg_entropy > 6.5 else 'DATA' if avg_entropy < 3.0 else 'UNKNOWN'
-                self.db.execute("UPDATE segments SET class = ? WHERE start_addr = ?", (seg_class, start))
             logger.info("Classification complete")
         except Exception as e:
             logger.warning(f"Classification failed: {e} - using default 'code'")

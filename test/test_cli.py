@@ -44,10 +44,13 @@ def test_cli_idc_failure():
         valid_dummy = f.name
 
     ada_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'ada.py')
+    # Run in a scratch dir: a successful MZ parse resets 'analysis.db' in cwd
+    # and must not clobber the repository's real analysis database.
+    scratch = tempfile.mkdtemp()
     try:
         result = subprocess.run(
             [sys.executable, ada_path, valid_dummy, '-s', invalid_idc],
-            capture_output=True, text=True
+            capture_output=True, text=True, cwd=scratch
         )
         assert result.returncode == 1, f"Expected exit 1, got {result.returncode}"
         output = result.stdout + result.stderr

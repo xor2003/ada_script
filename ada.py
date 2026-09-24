@@ -12,27 +12,11 @@ from pathlib import Path
 
 # Module imports for pipeline
 from mz_parser import MZParser
-from emulation_analyzer import EmulationAnalyzer
 from output_generator import OutputGenerator
-from database import Database
+from analysis_backend import AnalysisOptions
 
 from idc_engine import parse_idc
 
-def generate_asm_simple(db: Database, output_file: str, binary: bytes):
-    """Simple .asm generator: Query instructions → ASM format."""
-    try:
-        conn = db.conn
-        insts = conn.execute("SELECT addr, mnem, op_str FROM instructions WHERE type='code' ORDER BY addr").fetchall()
-        with open(output_file, 'w') as f:
-            f.write(f"; Simple ASM for {output_file}\n")
-            for addr, mnem, op_str in insts[:1000]:  # Limit for perf
-                if op_str:
-                    f.write(f"{hex(addr)}: {mnem} {op_str}\n")
-                else:
-                    f.write(f"{hex(addr)}: {mnem}\n")
-        logging.info(f"ASM generated: {output_file} ({len(insts)} insts)")
-    except Exception as e:
-        logging.warning(f"ASM gen failed: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Full Binary Analysis Pipeline.")
@@ -43,6 +27,12 @@ def main():
     parser.add_argument("--full", action="store_true", help="Full analysis (functions, CFG)")
     parser.add_argument("--classify", action="store_true", help="Classify code/data")
     parser.add_argument("--xrefs", action="store_true", help="Compute cross-references")
+    parser.add_argument(
+        "--backend",
+        choices=["capstone", "rizin"],
+        default="capstone",
+        help="Disassembly/analysis backend (default: capstone)",
+    )
     parser.add_argument('--version', action='version', version='%(prog)s 0.1.0')
     args = parser.parse_args()
 
@@ -71,6 +61,7 @@ def main():
         # Step 1: MZ Parsing
         mz_parser = MZParser(binary)
         db = mz_parser.parse()
+        db.binary = binary  # needed by analyzers/generator for byte reads
         logging.info("MZ parsing complete")
 
         # Step 2: Apply IDC (if provided) and insert to DB
@@ -88,20 +79,34 @@ def main():
             else:
                 logging.warning(f"IDC not found: {idc_path}")
 
-        # Step 3: Emulation Analysis (disasm, classify, functions, xrefs)
-        analyzer = EmulationAnalyzer(binary, db, full=args.full, classify=args.classify, xrefs=args.xrefs)
+        # Step 3: Analysis backend (disasm, classify, functions, xrefs)
+        options = AnalysisOptions(full=args.full, classify=args.classify, xrefs=args.xrefs)
+        if args.backend == "rizin":
+            from rizin_backend import RizinBackend
+            analyzer = RizinBackend(binary, db, options)
+        else:
+            # without IDC info, try rizin procedure discovery first
+            nfuncs = db.conn.execute("SELECT COUNT(*) FROM functions").fetchone()[0]
+            if nfuncs == 0:
+                try:
+                    from rizin_backend import discover_functions
+                    discover_functions(binary, db)
+                except Exception as exc:
+                    logging.info(f"Rizin discovery unavailable ({exc}); "
+                                 "falling back to capstone recursive descent")
+            from capstone_backend import CapstoneBackend
+            analyzer = CapstoneBackend(binary, db, options)
         analyzer.analyze()
-        db.binary = binary  # For generator
 
         # Step 4: Generate Outputs
-        generator = OutputGenerator(db)
+        generator = OutputGenerator(db, binary_path.name)
         stem = binary_path.stem
         lst_file = f"{stem}.lst"
         generator.generate_lst(lst_file)
 
-        # Generate .asm (simple fallback)
+        # Generate .asm (label-aware, same rendering as lst)
         asm_file = f"{stem}.asm"
-        generate_asm_simple(db, asm_file, binary)
+        generator.generate_asm(asm_file)
 
         # Step 5: MD Report (query DB)
         conn = db.conn
