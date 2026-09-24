@@ -127,6 +127,7 @@ class OutputGenerator:
             "SELECT addr, name FROM symbols WHERE auto=0")}
         self.labels = {a: n for a, n in c.execute(
             "SELECT addr, name FROM symbols")}  # explicit + auto
+        self._label_addrs = sorted(self.labels)
         self._name2addr = {n: a for a, n in self.labels.items()}
         # func names are operands too (call sub_XXXX) but live in the
         # functions table, not symbols
@@ -862,6 +863,7 @@ class OutputGenerator:
                         body = 'db ' + ','.join(
                             ida_num(x) for x in run)
                         la = addr + off
+                        lines += self._mid_equs(la, la + len(run), la, p)
                         lbl = self.labels.get(la)
                         if off == 0 and label:
                             lbl, label = label, None
@@ -887,6 +889,7 @@ class OutputGenerator:
                         body = 'db ' + ','.join(
                             ida_num(x) for x in run)
                         la = addr + off
+                        lines += self._mid_equs(la, la + len(run), la, p)
                         lbl = self.labels.get(la)
                         if off == 0 and label:
                             lbl, label = label, None
@@ -1214,6 +1217,23 @@ class OutputGenerator:
         if want and dsz and want != dsz:
             return f"{self._nf(name)} label {_SZ_KW[want]}"
         return None
+
+    def _mid_equs(self, lo, hi, base, p):
+        """`equ $+delta` lines for labels/func-starts strictly inside
+        (lo, hi); `base` is the address `$` resolves to at that point."""
+        out = []
+        i = bisect.bisect_right(self._label_addrs, lo)
+        j = bisect.bisect_left(self._label_addrs, hi)
+        mid = {lb: self.labels[lb] for lb in self._label_addrs[i:j]}
+        k = bisect.bisect_right(self.func_starts, lo)
+        while k < len(self.func_starts) and self.func_starts[k] < hi:
+            lb = self.func_starts[k]
+            mid.setdefault(lb, self.funcs[lb]['name'])
+            k += 1
+        for la in sorted(mid):
+            out.append(f"{p} {self._nf(mid[la])} equ "
+                       f"{self._equ_expr(mid[la], la - base, la in self.funcs)}")
+        return out
 
     _RE_MMX = re.compile(
         r'\bmm[0-7]\b|\b(?:emms|movq|movd|padd|psub|pcmpeq|pcmpgt|packss|'

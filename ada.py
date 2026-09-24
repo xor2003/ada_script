@@ -22,6 +22,9 @@ def main():
     parser = argparse.ArgumentParser(description="Full Binary Analysis Pipeline.")
     parser.add_argument("binary", nargs='?', help="Path to binary file (e.g., .exe)")
     parser.add_argument("-s", "--idc-script", help="IDC script to apply")
+    parser.add_argument("-r", "--runtime",
+                        help="libdosbox run-time info .json (execution coverage, "
+                             "segment values, data accesses)")
     parser.add_argument("-o", "--output", default="analysis.md", help="MD report (default: analysis.md)")
     parser.add_argument("--debug", action="store_true", help="Debug logging")
     parser.add_argument("--full", action="store_true", help="Full analysis (functions, CFG)")
@@ -78,6 +81,15 @@ def main():
                 script.insert_to_db()
             else:
                 logging.warning(f"IDC not found: {idc_path}")
+
+        # Step 2b: Apply libdosbox run-time info (if provided)
+        if args.runtime:
+            rt_path = Path(args.runtime)
+            if rt_path.exists():
+                from runtime_info import load_runtime_json
+                load_runtime_json(str(rt_path), db)
+            else:
+                logging.warning(f"Run-time info not found: {rt_path}")
 
         # Step 3: Analysis backend (disasm, classify, functions, xrefs)
         options = AnalysisOptions(full=args.full, classify=args.classify, xrefs=args.xrefs)
