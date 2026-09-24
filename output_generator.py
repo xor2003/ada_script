@@ -39,6 +39,15 @@ BANNER = "=============== S U B R O U T I N E " + "=" * 39
 SEP = "-" * 75
 SEGLINE = "=" * 75
 
+# near (intra-segment) branches: cannot reach a label in another physical
+# segment chunk -> byte-exact `db` fallback
+_NEAR_BRANCH = {
+    'jmp', 'call', 'jo', 'jno', 'jb', 'jnae', 'jc', 'jnb', 'jae', 'jnc',
+    'jz', 'je', 'jnz', 'jne', 'jbe', 'jna', 'ja', 'jnbe', 'js', 'jns',
+    'jp', 'jpe', 'jnp', 'jpo', 'jl', 'jnge', 'jge', 'jnl', 'jle', 'jng',
+    'jg', 'jnle', 'jcxz', 'jecxz', 'loop', 'loope', 'loopne', 'loopz',
+    'loopnz'}
+
 
 def ida_num(value, force_hex=False):
     if value < 0:
@@ -68,6 +77,31 @@ class OutputGenerator:
                 c.execute("SELECT start_addr, end_addr, base, class, type, "
                           "executable, name, align, comb FROM segments "
                           "ORDER BY start_addr"))]
+        # image regions outside every declared segment still hold real
+        # bytes (alignment gaps, overlay tails) -- synthesize data segments
+        # for them so the emitted image is complete
+        img_end = self.db.image_base + self.db.image_size
+        if img_end and self.segments:
+            gaps = []
+            prev = self.db.image_base
+            for s in self.segments:
+                if s['start'] > prev:
+                    gaps.append((prev, s['start']))
+                prev = max(prev, s['end'])
+            if prev < img_end:
+                gaps.append((prev, img_end))
+            used = {s['name'] for s in self.segments}
+            for gs, ge in gaps:
+                gi = 0
+                while f"seg{gi:03d}" in used:
+                    gi += 1
+                nm = f"seg{gi:03d}"
+                used.add(nm)
+                self.segments.append(
+                    {'start': gs, 'end': ge, 'base': gs >> 4,
+                     'class': 'DATA', 'type': '', 'exec': False,
+                     'name': nm, 'align': 1, 'comb': 2})
+            self.segments.sort(key=lambda s: s['start'])
         self.funcs = {s: {'end': e, 'name': n or f"sub_{s:X}", 'flags': f or 0}
                       for s, e, n, f in c.execute(
                           "SELECT start, end, name, flags FROM functions")}
@@ -76,6 +110,11 @@ class OutputGenerator:
             "SELECT addr, name FROM symbols WHERE auto=0")}
         self.labels = {a: n for a, n in c.execute(
             "SELECT addr, name FROM symbols")}  # explicit + auto
+        self._name2addr = {n: a for a, n in self.labels.items()}
+        # func names are operands too (call sub_XXXX) but live in the
+        # functions table, not symbols
+        self._name2addr.update(
+            {fv['name']: fa for fa, fv in self.funcs.items()})
         self.data_items = {a: (sz, k, cnt) for a, sz, k, cnt in c.execute(
             "SELECT addr, size, kind, count FROM data_items")}
         self.insns = {a: (sz, mn, ops, aops, dbh) for a, sz, mn, ops, aops, dbh
@@ -239,13 +278,25 @@ class OutputGenerator:
         return line
 
     # ------------------------------------------------------------- segments
-    def _seg_decl(self, seg):
+    def _seg_decl(self, seg, name=None, asm=False):
         align = {0: 'abs', 1: 'byte', 2: 'word', 3: 'para',
                  4: 'page', 5: 'dword', 6: 'qword'}.get(seg['align'], 'byte')
         comb = {0: 'private', 2: 'public', 4: 'public', 5: 'stack',
                 6: 'common'}.get(seg['comb'], 'public')
-        cls = seg['class'] or ('CODE' if seg['exec'] else 'DATA')
-        return f"{self._nf(seg['name'])}segment {align} {comb} '{cls}' use16"
+        if asm and comb == 'stack':
+            # 'stack' combine makes LINK drop the contents as BSS -- the
+            # original image stores those bytes, so keep it a plain data
+            # segment
+            comb = 'public'
+        if asm:
+            # LINK groups same-class segments together, which would reorder
+            # interleaved CODE/STACK/DATA regions -- one class preserves
+            # declaration order = original image order
+            cls = 'CODE'
+        else:
+            cls = seg['class'] or ('CODE' if seg['exec'] else 'DATA')
+        return (f"{self._nf(name or seg['name'])}segment {align} "
+                f"{comb} '{cls}' use16")
 
     def _seg_type_comment(self, seg):
         if seg['type'] == 'stack' or seg['class'] == 'STACK':
@@ -364,6 +415,14 @@ class OutputGenerator:
         if addr in self.relocs and size == 2:
             tgt = self.relocs[addr]
             seg = self.seg_of(tgt)
+            if asm:
+                # relocs[a] is the linear base the stored para points at --
+                # a mandatory chunk boundary, so the chunk starting exactly
+                # there reproduces the original stored value
+                cn = self._chunk_for(tgt) or \
+                    (self._nf(seg['name']) if seg else None)
+                return f"dw seg {cn}" if cn else \
+                    f"dw {ida_num(int.from_bytes(raw[:2], 'little'))}"
             return f"dw seg {seg['name']}" if seg else f"dw {ida_num(tgt)}"
         val = int.from_bytes(raw[:size], 'little')
         # explicit offset override: op_plain_offset(ea, n, base)
@@ -372,6 +431,10 @@ class OutputGenerator:
                 "SELECT arg FROM op_overrides WHERE addr=? AND kind='offset' "
                 "LIMIT 1", (addr,)).fetchone()
             if ovr:
+                if asm and size == 2:
+                    # a near offset word is never relocated -- emitting the
+                    # original value is byte-exact and needs no fixup frame
+                    return f"dw {ida_num(val, True)}"
                 tgt = (ovr[0] + val) & 0xFFFFFFFF
                 nm = self.labels.get(tgt)
                 return f"{d} offset {nm}" if nm else \
@@ -382,6 +445,8 @@ class OutputGenerator:
             if base is not None:
                 tgt = base * 16 + val
                 if tgt in self.names:
+                    if asm:
+                        return f"dw {ida_num(val, True)}"
                     return f"dw offset {self.names[tgt]}"
         if size == 4:
             lo, hi = val & 0xFFFF, val >> 16
@@ -392,6 +457,18 @@ class OutputGenerator:
             if seg:
                 t = (seg['base'] << 4) + lo
                 nm = self.labels.get(t)
+                if asm:
+                    # emit as offset-word + relocated seg word: the off
+                    # word keeps the original group-relative value while
+                    # `seg <chunk>` reproduces the original segment fixup;
+                    # a `label dword` keeps the item's declared type so
+                    # lds/les fixups still see a dword operand
+                    cn = self._chunk_for(seg['start']) or \
+                        self._nf(seg['name'])
+                    head = 'label dword\n' + ' ' * 24 \
+                        if self.labels.get(addr) else ''
+                    return (f"{head}dw {ida_num(lo, True)}\n"
+                            f"{'':24}dw seg {cn}")
                 if nm:
                     return f"dd {nm}"
                 if self.seg_of(t):
@@ -467,17 +544,95 @@ class OutputGenerator:
                 return True
         return False
 
+    def _seg_chunks(self, seg):
+        """Split a >64K segment into <=64K chunks.
+
+        MASM caps a segment at 64K; the original binary's oversized regions
+        were many linker-packed physical segments.  Chunk bases must include
+        every para the original code loaded into a segment register -- each
+        `assume` then names the right physical chunk and label fixups store
+        the same offsets the original did."""
+        # mandatory bases: every para the original image used as a segment
+        # base inside this region -- sreg values plus relocation targets
+        # (each stored seg word points at an original physical segment)
+        mand_set = {v << 4 for v in self._sreg_paras()}
+        mand_set.update(t for t in self.relocs.values() if t)
+        mand = sorted(b for b in mand_set
+                      if seg['start'] < b < seg['end'])
+        if seg['end'] - seg['start'] <= 0x10000 and not mand:
+            return [(seg['name'], seg['start'], seg['end'])]
+        # fill boundaries: instruction/data-item starts (labels can sit at
+        # mid-item addrs where a boundary would leave the item straddling)
+        bounds = sorted(set(self.insns) | set(self.data_items))
+        points = set(mand)
+        # every mandatory point must be a boundary; between them, add
+        # splits so no chunk exceeds 64K
+        queue = [seg['start']] + mand + [seg['end']]
+        queue = sorted(set(queue))
+        for i in range(len(queue) - 1):
+            lo, hi = queue[i], queue[i + 1]
+            while hi - lo > 0x10000:
+                limit = lo + 0x10000
+                j = bisect.bisect_right(bounds, limit) - 1
+                nxt = bounds[j] if j >= 0 and bounds[j] > lo else limit
+                points.add(nxt)
+                lo = nxt
+        points.add(seg['start'])
+        pts = sorted(points)
+        return [(f"{seg['name']}_{i}", s, e)
+                for i, (s, e) in enumerate(zip(pts, pts[1:] + [seg['end']]), 1)]
+
+    def _sreg_paras(self):
+        """All paras loaded into segment registers anywhere (sreg ranges)."""
+        ps = getattr(self, '_sreg_para_set', None)
+        if ps is None:
+            ps = self._sreg_para_set = {
+                v for _a, r, v in self.sreg_events if v >= 0}
+        return ps
+
+    def _chunk_for(self, lin):
+        """Name of the physical chunk containing linear address `lin`
+        (only inside >64K split segments); else None."""
+        cr = getattr(self, '_chunk_ranges', None)
+        if cr is None:
+            cr = self._chunk_ranges = [
+                (s, e, self._nf(n))
+                for sg in self.segments
+                for n, s, e in self._seg_chunks(sg)
+                if n != sg['name']]
+            self._segname2chunk = {
+                sg['name']: self._nf(self._seg_chunks(sg)[0][0])
+                for sg in self.segments
+                if len(self._seg_chunks(sg)) > 1}
+        for s, e, n in cr:
+            if s <= lin < e:
+                return n
+        return None
+
+    def _chunk_seg_refs(self, text):
+        """`seg segXXX` operand on a split segment: the big name doesn't
+        exist in the .asm -- resolve to the first physical chunk so the
+        stored para equals the original segment base."""
+        def rep(m):
+            cn = self._segname2chunk.get(m.group(1))
+            return 'seg ' + cn if cn else m.group(0)
+        return re.sub(r'seg (seg\w+)', rep, text)
+
     def _render_segment(self, seg, asm=False):
         lines = []
         p0 = self.prefix(seg, seg['start'])
+        chunks = self._seg_chunks(seg) if asm else \
+            [(seg['name'], seg['start'], seg['end'])]
+        chunk_i = 0
         if not asm:
             lines += [f"{p0} ; {SEGLINE}", p0,
                       f"{p0} ; Segment type: {self._seg_type_comment(seg)}",
                       f"{p0} {self._seg_decl(seg)}"]
         else:
-            lines.append(self._seg_decl(seg))
+            cname = chunks[0][0]
+            lines.append(self._seg_decl(seg, cname, asm=True))
             if seg['exec']:
-                lines.append(f"        assume cs:{seg['name']}")
+                lines.append(f"        assume cs:{self._nf(cname)}")
             lines.append("        assume ds:nothing, es:nothing, "
                          "ss:nothing")
 
@@ -499,6 +654,20 @@ class OutputGenerator:
             cur_func = None
 
         while addr < seg['end']:
+            # chunk boundary: close the current segment block and open the
+            # next chunk (an open proc must close first -- proc/endp cannot
+            # span two physical segments)
+            if asm and chunk_i + 1 < len(chunks) and \
+                    addr >= chunks[chunk_i][2]:
+                if cur_func is not None:
+                    close_func(addr)
+                    prev_break = True
+                lines.append(f"{self._nf(chunks[chunk_i][0])}ends")
+                chunk_i += 1
+                lines.append(self._seg_decl(seg, chunks[chunk_i][0], asm=True))
+                if seg['exec']:
+                    lines.append(
+                        f"        assume cs:{self._nf(chunks[chunk_i][0])}")
             # function end reached -> endp before this address' items
             if cur_func is not None and self.funcs[cur_func]['end'] > cur_func \
                     and addr >= self.funcs[cur_func]['end']:
@@ -511,6 +680,13 @@ class OutputGenerator:
                     sreg_i += 1
                     tgt = self.para2seg.get(val, 'nothing') \
                         if val is not None and val >= 0 else 'nothing'
+                    if val is not None and val >= 0:
+                        # inside a split segment the assume must name the
+                        # physical chunk so label fixups resolve against
+                        # the same base the original code used
+                        cn = self._chunk_for(val << 4)
+                        if cn:
+                            tgt = cn
                     lines.append(f"{p} assume {reg}:{tgt}")
             # anterior extra comments (except the -1 type comment which is
             # emitted inside the function header; the 1000+ file header
@@ -548,6 +724,51 @@ class OutputGenerator:
             # item body
             if is_code:
                 size, mnem, ops, aops, dbh = self.insns[addr]
+                if asm:
+                    # labels at mid-instruction addrs (e.g. SMC targets in
+                    # `ds:loc_x+N` refs) never get a line -- define them as
+                    # relocatable `equ $+delta` before the insn
+                    for la in sorted(lb for lb in self.labels
+                                     if addr < lb < addr + size):
+                        lines.append(
+                            f"{p} {self._nf(self.labels[la])} equ "
+                            f"$+{ida_num(la - addr)}")
+                if asm and not dbh and size == 5:
+                    raw = self._raw(addr, size)
+                    if raw and raw[0] in (0x9A, 0xEA) and \
+                            addr + 3 in self.relocs:
+                        # direct far call/jmp with a relocated seg word:
+                        # the stored para is the reloc target's chunk
+                        # base, not the label's own frame
+                        rc = self._chunk_for(self.relocs[addr + 3])
+                        if rc:
+                            pad = ' ' * max(1, 24 - len(p))
+                            lines.append(self._annotate(
+                                f"{p}{pad}db {ida_num(raw[0])} "
+                                f"; {mnem} {ops}", p, addr))
+                            lines.append(
+                                f"{p}{pad}dw "
+                                f"{ida_num(raw[1] | (raw[2] << 8))}")
+                            lines.append(f"{p}{pad}dw seg {rc}")
+                            prev_break = mnem in ('jmp', 'ljmp')
+                            last_addr = addr
+                            addr += size
+                            continue
+                if asm and not dbh and len(chunks) > 1 and \
+                        mnem in _NEAR_BRANCH:
+                    # a near branch across a chunk boundary cannot be
+                    # encoded -- emit the original bytes verbatim
+                    tgt = (aops or ops).split()[-1].rstrip(',')
+                    ta = self._name2addr.get(tgt)
+                    tseg = self.seg_of(ta) if ta is not None else None
+                    tchunk = self._chunk_for(ta) if ta is not None else None
+                    if not tchunk and tseg:
+                        tchunk = self._nf(tseg['name'])
+                    achunk = self._chunk_for(addr) or self._nf(seg['name'])
+                    if tchunk is not None and tchunk != achunk:
+                        raw = self._raw(addr, size)
+                        if raw:
+                            dbh = raw.hex()
                 if asm and dbh:
                     # uasm cannot reproduce the original encoding --
                     # emit the exact bytes, with the insn as a comment
@@ -559,6 +780,18 @@ class OutputGenerator:
                     if asm and aops:
                         ops = aops
                     text = mnem.ljust(8) + ops if ops else mnem
+                    if asm:
+                        text = self._chunk_seg_refs(text)
+                        # a `seg X` operand on a relocated imm field: the
+                        # stored para is the chunk base at relocs[field] --
+                        # resolve to that exact chunk, not the first one
+                        ra = next((a for a in range(addr, addr + size)
+                                   if a in self.relocs), None)
+                        if ra is not None:
+                            rc = self._chunk_for(self.relocs[ra])
+                            if rc:
+                                text = re.sub(r'seg \w+', 'seg ' + rc,
+                                              text, count=1)
                 line = f"{p}{' ' * max(1, 24 - len(p))}{text}"
                 lines.append(self._annotate(line, p, addr))
                 prev_break = mnem in ('jmp', 'ljmp', 'retn', 'retf', 'ret',
@@ -568,6 +801,41 @@ class OutputGenerator:
                 continue
             if addr in self.data_items:
                 size, kind, count = self.data_items[addr]
+                span = size * max(count, 1)
+                if asm and chunk_i + 1 < len(chunks) and \
+                        addr < chunks[chunk_i][2] < addr + span:
+                    # a mandatory chunk boundary lands inside this item
+                    # (an original segment base mid-array): emit the head
+                    # as raw bytes; the remainder continues in the next
+                    # chunk via the plain byte path
+                    b = chunks[chunk_i][2]
+                    raw = self._raw(addr, b - addr) or b''
+                    for off in range(0, len(raw), 16):
+                        run = raw[off:off + 16]
+                        body = 'db ' + ','.join(
+                            ida_num(x) for x in run)
+                        la = addr + off
+                        lbl = self.labels.get(la)
+                        if off == 0 and label:
+                            lbl, label = label, None
+                        if lbl:
+                            lines.append(
+                                f"{p} {self._nf(lbl)}{body}")
+                        else:
+                            lines.append(
+                                f"{p}{' ' * max(1, 24 - len(p))}{body}")
+                    last_addr = addr
+                    addr = b
+                    continue
+                if asm:
+                    # labels inside a multi-byte item never got their own
+                    # line -- define them as relocatable `equ $+delta` so
+                    # dw/ds: references resolve to the correct offset
+                    for la in sorted(lb for lb in self.labels
+                                     if addr < lb < addr + span):
+                        lines.append(
+                            f"{p} {self._nf(self.labels[la])} equ "
+                            f"$+{ida_num(la - addr)}")
                 if asm and label in self.branch_lbls:
                     # jump target on a db item: uasm needs a code-typed
                     # label, so emit `name::` then the unlabeled data
@@ -623,7 +891,8 @@ class OutputGenerator:
             if not (seg['start'] <= eaddr <= seg['end']):
                 eaddr = last_addr
             close_func(eaddr)
-        lines.append(f"{self.prefix(seg, last_addr)} {self._nf(seg['name'])}ends")
+        lines.append(f"{self.prefix(seg, last_addr)} "
+                     f"{self._nf(chunks[chunk_i][0])}ends")
         lines.append(self.prefix(seg, last_addr))
         return lines
 
@@ -652,8 +921,10 @@ class OutputGenerator:
                 for cl in self._cmt_lines(cm):
                     out.append(f"{p0} {cl}")
         out.append(p0)
-        out.append(f"{p0}                 .686p")
-        out.append(f"{p0}                 .mmx")
+        cpu, mmx = self._cpu_level()
+        out.append(f"{p0}                 {cpu}")
+        if mmx:
+            out.append(f"{p0}                 .mmx")
         out.append(f"{p0}                 .model large")
         out.append(p0)
         stem = re.sub(r'\W+', '_', self.filename.rsplit('.', 1)[0])
@@ -749,6 +1020,15 @@ class OutputGenerator:
         for nm in global_names:
             if nm.lower() in self._ASM_RESERVED and nm not in label_rn:
                 label_rn[nm] = fresh(nm)
+        # characters uasm can't take in an identifier (e.g. `RES_FRM1.HSQ`,
+        # `sub_x.2Hz`) -> replace with '_' and keep it unique
+        for nm in global_names:
+            if nm in label_rn:
+                continue
+            sane = re.sub(r'[^A-Za-z0-9_$?@]', '_', nm)
+            if sane != nm:
+                label_rn[nm] = sane if sane not in used else fresh(sane)
+                used.add(label_rn[nm])
         fvar_names = {nm for fv in self.frame_vars.values()
                       for nm, _ in fv.values()}
         for nm in sorted(fvar_names):
@@ -818,18 +1098,40 @@ class OutputGenerator:
             out.append('')
         return out
 
+    _RE_386 = re.compile(
+        r'\b(?:e[abcd]x|e[sb]p|e[sd]i|movsxd?|movzx|cdq|cwde|shld|shrd|'
+        r'bsf|bsr|bswap|cmpxchg|xadd|set\w+|cmov\w+|pushad|popad|lfs|lgs|'
+        r'lss|arpl|enter|leave|insd|outsd|lodsd|stosd|scasd|cmpsd|movsd|'
+        r'iretd|jecxz)\b')
+    _RE_MMX = re.compile(
+        r'\bmm[0-7]\b|\b(?:emms|movq|movd|padd|psub|pcmpeq|pcmpgt|packss|'
+        r'packus|punpck|pmul|pmadd|psra|psrl|psll|por|pxor|pand|pandn)\w*\b')
+
+    def _cpu_level(self):
+        """Minimum CPU directive for the decoded instruction set."""
+        is386 = mmx = False
+        for _s, mnem, ops, _a, _d in self.insns.values():
+            text = f"{mnem} {ops}"
+            if self._RE_MMX.search(text):
+                mmx = True
+            elif self._RE_386.search(text):
+                is386 = True
+        if mmx:
+            return ('.686p', True)
+        return ('.386', False) if is386 else ('.286', False)
+
     def generate_asm(self, output_file='output.asm'):
         """MASM-style .asm: same items without the seg:offset column."""
         self._asm_renames()
-        # .286: uasm's .386+ modes make even use16 segments default to
-        # 32-bit addressing (67h prefix on every absolute mem operand),
-        # which would shift all code and break short jumps
+        # use16 segments keep 16-bit addressing under any cpu directive;
+        # emit the lowest level that covers the decoded instruction set
         # no .model: it creates an empty DGROUP and silently assumes
         # `ds:DGROUP`, so every ds:/seg fixup resolves against the wrong
         # frame and alink reports "offset out of range".  Explicit
         # `assume` tracking (below, from the sreg ranges) replaces it.
+        cpu, mmx = self._cpu_level()
         out = ['; Generated by Ada Script', f'; Source: {self.filename}',
-               '', '.286', '']
+               '', cpu] + (['.mmx'] if mmx else []) + ['']
         out += self._asm_preamble()
         for seg in self.segments:
             for line in self._render_segment(seg, asm=True):

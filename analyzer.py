@@ -19,7 +19,13 @@ import re
 
 from capstone import CS_ARCH_X86, CS_MODE_16, CS_AC_WRITE, Cs
 from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
-from capstone.x86 import X86_REG_BP, X86_REG_SP, X86_REG_AX, X86_REG_AL
+from capstone.x86 import (
+    X86_REG_BP, X86_REG_SP, X86_REG_AX, X86_REG_AL,
+    X86_REG_BX, X86_REG_CX, X86_REG_DX,
+    X86_REG_SI, X86_REG_DI,
+    X86_REG_AH, X86_REG_BH, X86_REG_CH, X86_REG_DH,
+    X86_REG_CL, X86_REG_DL, X86_REG_BL,
+)
 from capstone.x86 import (
     X86_REG_ES, X86_REG_CS, X86_REG_SS, X86_REG_DS,
     X86_REG_FS, X86_REG_GS,
@@ -41,6 +47,22 @@ from capstone.x86_const import (
 logger = logging.getLogger(__name__)
 
 SEG_PREFIX = {0x26: 'es', 0x2E: 'cs', 0x36: 'ss', 0x3E: 'ds', 0x64: 'fs', 0x65: 'gs'}
+_PREFIX_BYTES = frozenset((0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65,
+                           0x66, 0x67, 0xF0, 0xF2, 0xF3))
+
+# modrm reg/rm field codes
+_REG_CODE = {
+    X86_REG_AL: 0, X86_REG_CL: 1, X86_REG_DL: 2, X86_REG_BL: 3,
+    X86_REG_AH: 4, X86_REG_CH: 5, X86_REG_DH: 6, X86_REG_BH: 7,
+    X86_REG_AX: 0, X86_REG_CX: 1, X86_REG_DX: 2, X86_REG_BX: 3,
+    X86_REG_SP: 4, X86_REG_BP: 5, X86_REG_SI: 6, X86_REG_DI: 7,
+}
+
+# d=0 (r/m-dest) encodings of the two-way ALU/mov opcodes; uasm always
+# canonicalizes reg,reg to the d=1 (reg-dest) encoding
+_RM_DEST_OPS = frozenset((0x00, 0x01, 0x08, 0x09, 0x10, 0x11, 0x18, 0x19,
+                          0x20, 0x21, 0x28, 0x29, 0x30, 0x31, 0x38, 0x39,
+                          0x88, 0x89))
 
 JCC_IDS = {X86_INS_JAE, X86_INS_JB, X86_INS_JBE, X86_INS_JA, X86_INS_JE,
            X86_INS_JNE, X86_INS_JS, X86_INS_JNS, X86_INS_JO, X86_INS_JNO,
@@ -75,10 +97,11 @@ MNEM_MAP = {'ret': 'retn', 'jae': 'jnb', 'xlatb': 'xlat',
 # shift/rotate instructions with implicit count 1 (D0/D1 encodings)
 SHIFT_IMPLICIT = {'rcl', 'rcr', 'rol', 'ror', 'shl', 'sal', 'shr', 'sar'}
 
-_STRIP_BASES = {'lodsb', 'lodsw', 'stosb', 'stosw', 'movsb', 'movsw',
-                'scasb', 'scasw', 'cmpsb', 'cmpsw', 'insb', 'insw',
-                'outsb', 'outsw', 'xlat', 'xlatb', 'pusha', 'popa',
-                'pushaw', 'popaw'}
+_STRIP_BASES = {'lodsb', 'lodsw', 'lodsd', 'stosb', 'stosw', 'stosd',
+                'movsb', 'movsw', 'movsd', 'scasb', 'scasw', 'scasd',
+                'cmpsb', 'cmpsw', 'cmpsd', 'insb', 'insw', 'insd',
+                'outsb', 'outsw', 'outsd', 'xlat', 'xlatb', 'pusha',
+                'popa', 'pushaw', 'popaw'}
 
 # string ops whose segment override can be expressed as an operand in asm
 # (override applies to the [si] source side; stos/scas have an es-implicit
@@ -159,6 +182,7 @@ class Analyzer:
         self.seg_words = set()    # data words loaded into a segment register
         self.bp_use = {}          # func -> {bp disp -> max access size}
         self.frame_sz = {}        # func -> {offset: byte size} for vars
+        self.frames = {}          # func -> (frsize, frregs, argsize)
 
         self.instructions = []    # decoded instruction dicts (code regions)
         self.covered = set()      # addrs covered by decoded instructions
@@ -207,6 +231,9 @@ class Analyzer:
         for f, off, n in c.execute(
                 "SELECT func_start, offset, name FROM frame_vars"):
             self.frame_vars.setdefault(f, {})[off] = n
+        for f, fs, fr, ar in c.execute(
+                "SELECT func_start, frsize, frregs, argsize FROM frames"):
+            self.frames[f] = (fs or 0, fr or 0, ar or 0)
         for a, cm in c.execute("SELECT addr, comment FROM comments"):
             self.comments[a] = cm
         for a, ln, cm in c.execute(
@@ -232,6 +259,24 @@ class Analyzer:
             if s['start'] <= addr < s['end']:
                 return s
         return None
+
+    def _in_chunked(self, addr):
+        """True when addr's segment is physically split in the .asm:
+        either it exceeds 64K (uasm segment limit) or an interior para was
+        used as a segment base (sreg value / relocation target) and becomes
+        a chunk boundary.  Symbolic operands may then resolve against a
+        frame the original did not use -- emit the original numeric."""
+        s = self.seg_of(addr)
+        if s is None:
+            return False
+        if s['end'] - s['start'] > 0x10000:
+            return True
+        ps = getattr(self, '_mand_bases', None)
+        if ps is None:
+            ps = self._mand_bases = {
+                v << 4 for _a, _r, v in self.sreg_ranges if v >= 0
+            } | set(self.relocs.values())
+        return any(s['start'] < b < s['end'] for b in ps)
 
     def _fix_target(self, addr, raw):
         """Capstone computes near-branch targets without 16-bit IP wraparound.
@@ -599,7 +644,7 @@ class Analyzer:
         f = inst.get('func')
         fv = self.frame_vars.get(f, {}) if f is not None else {}
         finfo = self.funcs.get(f) if f is not None else None
-        has_frame = bool(fv) or \
+        has_frame = bool(fv) or f in self.frames or \
             (finfo is not None and bool(finfo['flags'] & 0x10))
         fname = None
         if has_frame:
@@ -622,7 +667,13 @@ class Analyzer:
         atxt = txt
         if ptr_kw:
             if insn.id in (X86_INS_PUSH, X86_INS_POP):
-                pass
+                # push/pop never print a ptr keyword, but uasm still needs
+                # one when the equate is declared wider than the access
+                # (e.g. `push [bp+dwordarg+2]` -> 66h prefix without it)
+                if acc and vsz and acc != vsz:
+                    d = self._sz_kw(acc)
+                    if d:
+                        atxt = d + ' ptr ' + atxt
             elif ptr_kw == 'byte ptr' and not need:
                 if acc and vsz and acc != vsz:
                     atxt = 'byte ptr ' + atxt
@@ -682,8 +733,9 @@ class Analyzer:
         m = op.mem
         dsz = insn.encoding.disp_size if insn.encoding else 0
         lbl = decl_sz = None
+        is_code = False
         if target is not None and target >= self.base:
-            lbl, decl_sz = self._mem_label(target)
+            lbl, decl_sz, is_code = self._mem_label(target)
         if lbl is None:
             if dsz == 2:
                 # disp16 that can't be expressed as `label[reg]` (no label
@@ -695,6 +747,12 @@ class Analyzer:
         p = (ptr_kw + ' ') if (ptr_kw and (
             self._ptr_needed(insn, opi) or mism)) else ''
         ap = self._asm_ptr(p, acc, decl_sz)
+        if is_code and not ap and acc:
+            # a `::` near label is not a valid data operand for uasm even
+            # when sizes match -- always qualify the access explicitly
+            kw = self._sz_kw(acc)
+            ap = (kw + ' ptr ') if kw else ap
+        np = ap or (ptr_kw + ' ' if ptr_kw else '')
         if self.seg_of(target) is not None and dsz == 1:
             # A symbolic `label[reg]` disp is relocatable, so uasm must
             # encode disp16 -- but the original instruction used disp8.
@@ -702,7 +760,13 @@ class Analyzer:
             # modrm (the label form stays in the .lst).
             num = inner + ('+' if m.disp >= 0 else '-') + \
                 ida_num(abs(m.disp))
-            atxt = ap + (segname or '') + f"[{num}]"
+            atxt = np + (segname or '') + f"[{num}]"
+        elif self._in_chunked(target):
+            # chunked-seg label: symbolic form resolves against the wrong
+            # frame -- emit the stored displacement numerically
+            num = inner + ('+' if m.disp >= 0 else '-') + \
+                ida_num(abs(m.disp))
+            atxt = np + (segname or '') + f"[{num}]"
         elif self.seg_of(target) is not None:
             # uasm needs an explicit seg on a label operand; a relocatable
             # disp always encodes disp16, matching the original mod=10
@@ -719,7 +783,7 @@ class Analyzer:
             # so the .asm must use the numeric displacement
             num = inner + ('+' if m.disp >= 0 else '-') + \
                 ida_num(abs(m.disp))
-            atxt = ap + (segname or '') + f"[{num}]"
+            atxt = np + (segname or '') + f"[{num}]"
         if atxt is not None:
             inst.setdefault('asm_ops_map', {})[opi] = atxt
         return p + (segname or '') + f"{lbl}[{inner}]"
@@ -730,7 +794,7 @@ class Analyzer:
         addr = inst['addr']
         seg, target = self._mem_target(insn, op, addr)
         if target is not None and target >= self.base:
-            lbl, decl_sz = self._mem_label(target)
+            lbl, decl_sz, is_code = self._mem_label(target)
             if lbl is not None:
                 # IDA prints "X ptr" when access size differs from the
                 # declared item size, or when size can't be inferred
@@ -744,10 +808,26 @@ class Analyzer:
                 # ptr when access size != declared item size; labels
                 # outside every segment are never declared -> numeric
                 ap = self._asm_ptr(ptr, acc, decl_sz)
-                if self.seg_of(target) is not None:
+                if is_code and not ap and acc:
+                    # a `::` near label is not a valid data operand for
+                    # uasm even when sizes match -- qualify explicitly
+                    kw = self._sz_kw(acc)
+                    ap = (kw + ' ptr ') if kw else ap
+                # a numeric displacement carries no declared type --
+                # keep capstone's size keyword if it printed one (e.g.
+                # `shl word ptr ds:X, cl`, where cl is a count not a size)
+                np = ap or (ptr_kw + ' ' if ptr_kw else '')
+                if self._in_chunked(target):
+                    # label sits in a physically split segment: uasm would
+                    # resolve it chunk-relative, not against the frame the
+                    # original used -- emit the stored displacement, exactly
+                    # like IDA's `ds:3810h` numeric form
+                    atxt = np + (segname or f"{seg}:") + \
+                        ida_num(m.disp & 0xFFFF)
+                elif self.seg_of(target) is not None:
                     atxt = ap + (segname or f"{seg}:") + lbl
                 else:
-                    atxt = ap + (segname or '') + \
+                    atxt = np + (segname or '') + \
                         f"[{ida_num(m.disp & 0xFFFF)}]"
                 inst.setdefault('asm_ops_map', {})[opi] = atxt
                 return ptr + (segname or '') + lbl
@@ -773,6 +853,13 @@ class Analyzer:
                 segname = SEG_PREFIX[p] + ':'
         base = insn.reg_name(m.base) if m.base else None
         index = insn.reg_name(m.index) if m.index else None
+
+        # original encoded mod=10 disp16 but the value fits a signed byte:
+        # uasm always minimizes a numeric/symbolic disp to mod=01 disp8
+        # (one byte shorter) -- keep the original encoding verbatim
+        if insn.encoding and insn.encoding.disp_size == 2 and \
+                (base or index) and -128 <= m.disp <= 127:
+            inst['db_bytes'] = insn.bytes
 
         if m.base == X86_REG_BP:
             return self._mem_bp(inst, insn, opi, op, segname, ptr_kw)
@@ -836,8 +923,14 @@ class Analyzer:
                 inner += ('+' if m.disp >= 0 else '-') + ida_num(abs(m.disp))
         elif m.disp:
             inner = ida_num(m.disp & 0xFFFF)
-        ptr = (ptr_kw + ' ') if (ptr_kw and self._ptr_needed(insn, opi)) else ''
-        return ptr + (segname or '') + '[' + inner + ']'
+        far_mem = insn.id in (X86_INS_LES, X86_INS_LDS,
+                              X86_INS_LCALL, X86_INS_LJMP)
+        if far_mem:
+            return 'dword ptr ' + (segname or '') + '[' + inner + ']'
+        # a bare numeric operand has no declared type -- keep capstone's
+        # size keyword (`shl [x], cl` can't infer the width from cl)
+        return ((ptr_kw + ' ') if ptr_kw else '') + \
+            (segname or '') + '[' + inner + ']'
 
     def _stkvar_size(self, func, disp):
         """Size of the var enclosing disp (for ptr emission decisions)."""
@@ -865,10 +958,22 @@ class Analyzer:
         finfo = self.funcs.get(func)
         far = bool(finfo and finfo['flags'] & 2)
         args_base = 6 if far else 4
-        return f"arg_{disp - args_base:X}" if disp >= 0 else f"var_{-disp:X}"
+        if disp >= args_base:
+            return f"arg_{disp - args_base:X}"
+        if disp >= 0:
+            # saved bp / return-address zone: IDA names it var_sN only for
+            # slots covered by the frame's frregs (saved registers) size
+            fr = self.frames.get(func)
+            if fr and disp >= args_base - fr[1]:
+                return f"var_s{disp:X}"
+            return None
+        return f"var_{-disp:X}"
 
     def _mem_label(self, target):
-        """(label, declared_size) for an absolute memory target, or (None, 0)."""
+        """(label, declared_size, is_code) for an absolute memory target,
+        or (None, 0, False).  is_code marks loc_/sub_-style labels that
+        uasm emits as `::` near labels -- they always need an explicit
+        `X ptr` when accessed as data."""
         # inside a known data item -> itemlabel+delta
         di = self._di_sorted
         i = bisect.bisect_right(di, target) - 1
@@ -883,18 +988,21 @@ class Analyzer:
                 if d:
                     lbl = f"{lbl}+{ida_num(d, True)}"
                 # 'str' size is the string length; the emitted element is db
-                return lbl, (1 if k == 'str' else sz)
+                return lbl, (1 if k == 'str' else sz), False
         # labels not on a data item are emitted as `db` in the .asm; report
         # size 1 so mismatched word/dword accesses get an explicit ptr
         if target in self.names or target in self.auto_names:
-            return self.label_at(target), 1
+            code = target in self.funcs or target in self.covered
+            return self.label_at(target), 2 if code else 1, code
         near = self._nearest_label_below(target)
         if near is not None:
             nm, off = near
+            code = (target - off) in self.covered or \
+                (target - off) in self.funcs
             if off:
-                return f"{nm}+{ida_num(off, True)}", 1
-            return nm, 1
-        return None, 0
+                return f"{nm}+{ida_num(off, True)}", 2 if code else 1, code
+            return nm, 2 if code else 1, code
+        return None, 0, False
 
     def _offset_expr(self, target):
         """Render a linear target for op_plain_offset: struct-member or label.
@@ -919,7 +1027,7 @@ class Analyzer:
                 if rem:
                     expr += f"+{ida_num(rem, True)}"
                 return f"({expr})" if '+' in expr else expr
-        lbl, _ = self._mem_label(target)
+        lbl, _, _ = self._mem_label(target)
         if lbl is None:
             return None
         return f"({lbl})" if '+' in lbl else lbl
@@ -982,6 +1090,11 @@ class Analyzer:
                 if iid in CALL_IDS:
                     fv = self.funcs.get(val)
                     lbl = fv['name'] if fv else self.label_at(val, 'sub')
+                    # `call farproc` makes uasm emit `push cs; call near` --
+                    # pin the original near form with an explicit qualifier
+                    if lbl:
+                        inst.setdefault('asm_ops_map', {})[opi] = \
+                            'near ptr ' + lbl
                     return lbl or ida_num(val)
                 fv = self.funcs.get(val)
                 if fv is not None:
@@ -989,7 +1102,14 @@ class Analyzer:
                 else:
                     lbl = self.label_at(val, 'loc')
                 short = bool(insn.bytes) and insn.bytes[0] in SHORT_JMP_OPS
-                return ('short ' if short else '') + (lbl or ida_num(val))
+                lbltxt = lbl or ida_num(val)
+                # asm: bare label lets uasm auto-fit short/near (drift-safe),
+                # `near ptr` pins the original near form so it can't shrink;
+                # loop/jcxz are short-only -- no near form exists for them
+                if lbl and insn.bytes and insn.bytes[0] not in LOOP_OPS:
+                    inst.setdefault('asm_ops_map', {})[opi] = \
+                        lbltxt if short else 'near ptr ' + lbltxt
+                return ('short ' if short else '') + lbltxt
             if val < 0:
                 return self._op_num(val, ovr[0] if ovr else None)
             # enum override (only this operand's override — never the sibling
@@ -1015,6 +1135,16 @@ class Analyzer:
                 target = off_ovr + val
                 lbl, delta = self._offset_label(target)
                 if lbl:
+                    if getattr(op, 'size', 0) == 1:
+                        # an imm8 can't carry a word-sized offset fixup
+                        # in uasm -- emit the original bytes verbatim
+                        inst['db_bytes'] = insn.bytes
+                    elif self._in_chunked(target):
+                        # chunked-seg label: `offset` would resolve against
+                        # the physical chunk base, not the segment frame the
+                        # original stored -- emit the original imm verbatim
+                        inst.setdefault('asm_ops_map', {})[opi] = \
+                            ida_num(val, True)
                     if delta:
                         return f"(offset {lbl}+{ida_num(delta)})"
                     return f"offset {lbl}"
@@ -1028,6 +1158,9 @@ class Analyzer:
                 if ds is not None and ds >= 0:
                     t = ds * 16 + val
                     if self._offset_worthy(t):
+                        if self._in_chunked(t):
+                            inst.setdefault('asm_ops_map', {})[opi] = \
+                                ida_num(val, True)
                         lbl = self.label_at(t)
                         return lbl if iid == X86_INS_PUSH \
                             else f"offset {lbl}"
@@ -1079,6 +1212,33 @@ class Analyzer:
         iid = insn.id
         mnem = insn.mnemonic
         enc = insn.encoding
+        # redundant prefixes (double lock, repeated seg override): capstone
+        # reports each class once and uasm emits at most one -- a longer
+        # prefix run in the original bytes is unexpressible
+        if insn.bytes:
+            lead = 0
+            while lead < insn.size and insn.bytes[lead] in _PREFIX_BYTES:
+                lead += 1
+            if lead > sum(1 for p in insn.prefix if p):
+                inst['db_bytes'] = insn.bytes
+            elif lead < insn.size and insn.bytes[lead] == 0x82:
+                # opcode 82h is the alias of group1-imm8 opcode 80h; uasm
+                # always encodes 80h
+                inst['db_bytes'] = insn.bytes
+            elif len(ops) == 2 and ops[0].type == X86_OP_REG and \
+                    ops[1].type == X86_OP_REG and lead + 1 < insn.size:
+                opc, modrm = insn.bytes[lead], insn.bytes[lead + 1]
+                if opc in _RM_DEST_OPS and modrm >= 0xC0:
+                    # uasm canonicalizes reg,reg ALU/mov ops to the
+                    # reg-dest encoding (opcode+2, swapped modrm fields)
+                    inst['db_bytes'] = insn.bytes
+                elif opc in (0x84, 0x85) and modrm >= 0xC0:
+                    c0 = _REG_CODE.get(ops[0].reg)
+                    c1 = _REG_CODE.get(ops[1].reg)
+                    if c0 is not None and c1 is not None and \
+                            modrm != 0xC0 | (c0 << 3) | c1:
+                        # uasm encodes operand 0 into the modrm reg field
+                        inst['db_bytes'] = insn.bytes
         if enc is not None and enc.imm_size == 2 and ops and \
                 ops[-1].type == X86_OP_IMM and insn.bytes and \
                 insn.bytes[0] in self._IMM16_OPT_OPS:
@@ -1129,16 +1289,37 @@ class Analyzer:
             if target in self.names or target in self.auto_names or \
                     target in self.call_refs:
                 return f"far ptr {self.label_at(target, 'sub')}"
+            # uasm can't encode a numeric-seg far pointer -> raw bytes
+            inst['db_bytes'] = insn.bytes
             return f"far ptr {ida_num(segv)}:{ida_num(offv)}"
         if not ops:
             inst['mnem'] = MNEM_MAP.get(mnem, mnem)
+            if mnem == 'int1' or \
+                    any(p in SEG_PREFIX for p in insn.prefix):
+                # uasm rejects `int1`; `int 1` would encode CD 01 not F1.
+                # a bare seg override on an operand-less insn (cs:xlatb)
+                # is equally unexpressible -- keep the original bytes
+                inst['db_bytes'] = insn.bytes
             return ''
         if mnem.split()[-1] in _STRIP_BASES:
             inst['mnem'] = mnem
-            segp = insn.prefix[1] if len(insn.prefix) > 1 else 0
-            if segp in SEG_PREFIX:
-                form = _STRSEG_FORMS.get(mnem.split()[-1])
-                repp = insn.prefix[0] if len(insn.prefix) > 0 else 0
+            base = mnem.split()[-1]
+            # a prefix byte can be rep (F0/F2/F3) or a seg override in any
+            # position -- a lone `cs:xlat` has only the seg prefix
+            repp = next((p for p in insn.prefix
+                         if p in (0xF0, 0xF2, 0xF3)), 0)
+            segp = next((p for p in insn.prefix if p in SEG_PREFIX), 0)
+            if base.endswith('d'):
+                # uasm has no movsd/lodsd/... mnemonic at all; the operand
+                # form needs `movs dword ptr` + a 66h prefix -- keep the
+                # original bytes verbatim instead
+                inst['db_bytes'] = insn.bytes
+            # uasm only allows repne (F2) on cmps/scas and rep (F3) elsewhere
+            elif repp == 0xF2 and base not in ('cmpsb', 'cmpsw',
+                                               'scasb', 'scasw'):
+                inst['db_bytes'] = insn.bytes
+            elif segp in SEG_PREFIX:
+                form = _STRSEG_FORMS.get(base)
                 if form is None or repp in (0xF0, 0xF2, 0xF3):
                     # can't express the override in uasm syntax
                     inst['db_bytes'] = insn.bytes
@@ -1170,7 +1351,7 @@ class Analyzer:
             finfo = self.funcs.get(f)
             flags = finfo['flags'] if finfo else 0
             declared = self.frame_vars.get(f) or {}
-            if not declared and not (flags & 0x10):
+            if not declared and not (flags & 0x10) and f not in self.frames:
                 continue  # not a bp frame -> leave [bp-N] numeric
             far = bool(flags & 2)
             args_base = 6 if far else 4
@@ -1210,6 +1391,12 @@ class Analyzer:
                 fv[d] = f"arg_{d - args_base:X}"
                 szs[d] = sz
                 spans.append((d, sz))
+            # saved-regs zone (IDA var_sN): accessed slots covered by frregs
+            frregs = self.frames.get(f, (0, 0, 0))[1]
+            for d in sorted(a for a in access if 0 <= a < args_base):
+                if d >= args_base - frregs and not covered(d):
+                    fv[d] = f"var_s{d:X}"
+                    szs[d] = min(4, max(2, access[d]))
             for off, nm in fv.items():
                 self.db.execute(
                     "INSERT OR REPLACE INTO frame_vars "
