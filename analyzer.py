@@ -18,6 +18,7 @@ import logging
 import re
 
 from capstone import CS_AC_WRITE, CS_ARCH_X86, CS_MODE_16, Cs
+from capstone import x86_const as _cx86
 from capstone.x86 import (
     X86_OP_IMM,
     X86_OP_MEM,
@@ -46,6 +47,7 @@ from capstone.x86 import (
     X86_REG_SS,
 )
 from capstone.x86_const import (
+    X86_GRP_FPU,
     X86_INS_BOUND,
     X86_INS_CALL,
     X86_INS_HLT,
@@ -109,16 +111,72 @@ _RM_DEST_OPS = frozenset((0x00, 0x01, 0x08, 0x09, 0x10, 0x11, 0x18, 0x19,
 
 # mnemonics capstone may emit that uasm cannot assemble at all
 _ASM_NO_MNEM = frozenset((
-    'int3', 'salc', 'fcompi', 'fisttp', 'bswap',
+    'int3', 'int1', 'salc', 'fcompi', 'fisttp', 'bswap',
     # Katmai/Athlon additions beyond .686p MMX
     'pavgb', 'pavgw', 'pextrw', 'pinsrw', 'pmaxsw', 'pmaxub', 'pminsw',
     'pminub', 'pmovmskb', 'pmulhuw', 'psadbw', 'pshufw', 'sfence',
     'maskmovq', 'movntq', 'femms', 'prefetchnta', 'prefetcht0',
     'prefetcht1', 'prefetcht2',
+    # MMX insns uasm 2.57 lacks, MPX, CET and other oddballs
+    'psubq', 'prefetch', 'getsec', 'endbr32', 'endbr64',
+    'bnd', 'bndcl', 'bndcn', 'bndcu', 'bndldx', 'bndmk', 'bndmov',
+    'bndstx', 'nopw', 'nopd', 'notrack', 'pshufb',
+    # SSE1/SSE2+ mnemonics uasm rejects at .686p (capstone groups are
+    # empty for these on capstone 5, so deny by name)
+    'addps', 'addss', 'andps', 'andnps', 'cmpps', 'cmpss', 'comiss',
+    'cvtpi2ps', 'cvtps2pi', 'cvtsi2ss', 'cvtss2si', 'cvttps2pi',
+    'cvttss2si', 'divps', 'divss', 'ldmxcsr', 'maxps', 'maxss',
+    'minps', 'minss', 'movaps', 'movhps', 'movhlps', 'movlps',
+    'movlhps', 'movmskps', 'movntps', 'movss', 'movups', 'mulps',
+    'mulss', 'orps', 'rcpps', 'rcpss', 'rsqrtps', 'rsqrtss', 'shufps',
+    'sqrtps', 'sqrtss', 'stmxcsr', 'subps', 'subss', 'ucomiss',
+    'unpckhps', 'unpcklps', 'xorps', 'addpd', 'addsd', 'andpd',
+    'andnpd', 'cmppd', 'comisd', 'cvtdq2pd', 'cvtdq2ps',
+    'cvtpd2dq', 'cvtpd2pi', 'cvtpd2ps', 'cvtpi2pd', 'cvtps2dq',
+    'cvtps2pd', 'cvtsd2si', 'cvtsd2ss', 'cvtsi2sd', 'cvtss2sd',
+    'cvttpd2dq', 'cvttpd2pi', 'cvttps2dq', 'cvttsd2si', 'divpd',
+    'divsd', 'maxpd', 'maxsd', 'minpd', 'minsd', 'movapd', 'movdqa',
+    'movdqu', 'movhpd', 'movlpd', 'movmskpd', 'movntdq', 'movnti',
+    'movntpd', 'movq2dq', 'movdq2q', 'movsd', 'movupd', 'mulpd',
+    'mulsd', 'orpd', 'shufpd', 'sqrtpd', 'sqrtsd', 'subpd', 'subsd',
+    'ucomisd', 'unpckhpd', 'unpcklpd', 'xorpd', 'movddup', 'movshdup',
+    'movsldup', 'addsubpd', 'addsubps', 'haddpd', 'haddps', 'hsubpd',
+    'hsubps', 'lddqu', 'monitor', 'mwait', 'fisttp', 'psignb',
+    'psignw', 'psignd', 'pmulhrsw', 'pmaddubsw', 'phaddw', 'phaddd',
+    'phaddsw', 'phsubw', 'phsubd', 'phsubsw', 'pabsb', 'pabsw',
+    'pabsd', 'pshuflw', 'pshufhw', 'pshufd', 'pslldq', 'psrldq',
     # privileged / long-mode insns
     'syscall', 'sysenter', 'sysexit', 'sysret', 'swapgs', 'rdmsr',
     'wrmsr', 'rdtsc', 'rdtscp', 'rdpmc', 'ud0', 'ud1', 'ud2',
 ))
+
+# capstone insn groups beyond what uasm accepts under .686p/.mmx
+# (SSE and later ISA families) -- decoded bytes are emitted verbatim
+_ASM_BAD_GROUPS = frozenset(
+    getattr(_cx86, n) for n in (
+        'X86_GRP_3DNOW', 'X86_GRP_SSE1', 'X86_GRP_SSE2', 'X86_GRP_SSE3',
+        'X86_GRP_SSSE3', 'X86_GRP_SSE41', 'X86_GRP_SSE42', 'X86_GRP_SSE4A',
+        'X86_GRP_AVX', 'X86_GRP_AVX2', 'X86_GRP_AVX512', 'X86_GRP_AES',
+        'X86_GRP_SHA', 'X86_GRP_F16C', 'X86_GRP_FMA', 'X86_GRP_FMA4',
+        'X86_GRP_BMI1', 'X86_GRP_BMI2', 'X86_GRP_ADX', 'X86_GRP_PFI',
+        'X86_GRP_RTM', 'X86_GRP_TBM', 'X86_GRP_XOP', 'X86_GRP_CDI',
+        'X86_GRP_DQI', 'X86_GRP_ERI', 'X86_GRP_BWI', 'X86_GRP_FSGSBASE',
+        'X86_GRP_HLE', 'X86_GRP_NOVLX', 'X86_GRP_VLX', 'X86_GRP_SMAP',
+        'X86_GRP_PCLMUL', 'X86_GRP_VM', 'X86_GRP_SGX')
+    if hasattr(_cx86, n))
+del _cx86
+
+# `lock` is only legal on read-modify-write ops with a memory destination
+_ASM_LOCKABLE = frozenset((
+    'add', 'adc', 'and', 'btc', 'btr', 'bts', 'cmpxchg', 'dec', 'inc',
+    'neg', 'not', 'or', 'sbb', 'sub', 'xadd', 'xchg', 'xor'))
+
+# rep/repne/repe are only legal on string ops
+_ASM_REPABLE = frozenset((
+    'ins', 'insb', 'insw', 'insd', 'outs', 'outsb', 'outsw', 'outsd',
+    'movs', 'movsb', 'movsw', 'movsd', 'lods', 'lodsb', 'lodsw', 'lodsd',
+    'stos', 'stosb', 'stosw', 'stosd', 'scas', 'scasb', 'scasw', 'scasd',
+    'cmps', 'cmpsb', 'cmpsw', 'cmpsd'))
 
 # FPU arithmetic ops rendered by capstone as a single `st(n)` operand;
 # uasm requires the explicit two-register form -> keep original bytes
@@ -131,6 +189,18 @@ _ASM_FPU_SINGLE = frozenset((
 _DWORD_MNEMS = frozenset((
     'pushfd', 'popfd', 'iretd', 'pushad', 'popad',
 ))
+
+# 32-bit general registers (used to test whether a 66h prefix is real --
+# a bare prefix test can't distinguish `es` from `e`-register names)
+_EREGS = frozenset((
+    'eax', 'ebx', 'ecx', 'edx', 'esi', 'edi', 'ebp', 'esp'))
+
+# system insns whose memory operand has a fixed layout -- a 66h prefix on
+# them has no expressible asm form (sgdt always stores 6 bytes, etc.)
+_SYS_FIXED_MNEMS = frozenset((
+    'sgdt', 'sidt', 'lgdt', 'lidt', 'sldt', 'str', 'smsw', 'lmsw',
+    'lldt', 'ltr', 'invd', 'invlpg', 'wbinvd', 'clts', 'verr', 'verw',
+    'lar', 'lsl', 'arpl', 'cpuid', 'movntq', 'prefetchw'))
 
 JCC_IDS = {X86_INS_JAE, X86_INS_JB, X86_INS_JBE, X86_INS_JA, X86_INS_JE,
            X86_INS_JNE, X86_INS_JS, X86_INS_JNS, X86_INS_JO, X86_INS_JNO,
@@ -291,6 +361,13 @@ class Analyzer:
         for s, r, v in c.execute(
                 "SELECT start_addr, reg, value FROM sreg_ranges ORDER BY start_addr"):
             self.sreg_ranges.append((s, r, v))
+        # sreg_value() is called per operand; keep per-reg sorted lists so a
+        # lookup is a bisect instead of a full scan
+        self._sreg_starts = {}
+        self._sreg_vals = {}
+        for s, r, v in self.sreg_ranges:
+            self._sreg_starts.setdefault(r, []).append(s)
+            self._sreg_vals.setdefault(r, []).append(v)
         for eid, nm, val in c.execute(
                 "SELECT enum_id, name, value FROM enum_members"):
             self.enum_members.setdefault(eid, {})[val] = nm
@@ -363,12 +440,20 @@ class Analyzer:
         """Default/implied segment register value (paragraph) at addr."""
         # explicit split_sreg_range wins: ranges start at each row, run to the
         # next row for the same reg.
-        best = None
-        for s, r, v in self.sreg_ranges:
-            if r == reg and s <= addr and (best is None or s > best[0]):
-                best = (s, v)
-        if best is not None:
-            return best[1]
+        starts = getattr(self, '_sreg_starts', None)
+        if starts is None:
+            best = None
+            for s, r, v in self.sreg_ranges:
+                if r == reg and s <= addr and (best is None or s > best[0]):
+                    best = (s, v)
+            if best is not None:
+                return best[1]
+        else:
+            sl = starts.get(reg)
+            if sl:
+                i = bisect.bisect_right(sl, addr) - 1
+                if i >= 0:
+                    return self._sreg_vals[reg][i]
         seg = self.seg_of(addr)
         if seg and (seg['start'], reg) in self.sregs:
             return self.sregs[(seg['start'], reg)]
@@ -798,6 +883,10 @@ class Analyzer:
         if inner0 or m.disp:
             inst.setdefault('asm_ops_map', {})[opi] = \
                 self._numeric_mem(insn, opi, m, segname, ptr_kw)
+            if not (m.base or m.index):
+                # a pure-disp numeric (`es:[20h]`) assembles as a 32-bit
+                # displacement -- never the original disp16
+                inst['db_bytes'] = insn.bytes
         return (ptr_kw + ' ' if ptr_kw and self._ptr_needed(insn, opi)
                 else '') + (segname or '') + expr
 
@@ -906,14 +995,17 @@ class Analyzer:
                     # like IDA's `ds:3810h` numeric form
                     atxt = np + (segname or f"{seg}:") + \
                         ida_num(m.disp & 0xFFFF)
+                    inst['db_bytes'] = insn.bytes
                 elif self.seg_of(target) is not None:
                     atxt = ap + (segname or f"{seg}:") + lbl
                 else:
                     atxt = np + (segname or '') + \
                         f"[{ida_num(m.disp & 0xFFFF)}]"
+                    inst['db_bytes'] = insn.bytes
                 inst.setdefault('asm_ops_map', {})[opi] = atxt
                 return ptr + (segname or '') + lbl
         segp = segname or f"{seg}:"
+        inst['db_bytes'] = insn.bytes
         return (ptr_kw + ' ' if ptr_kw else '') + \
             f"{segp}{ida_num(m.disp)}"
 
@@ -1369,6 +1461,25 @@ class Analyzer:
                         regf == 0x08:
                     # the test /1 memory alias is emitted as /0
                     inst['db_bytes'] = insn.bytes
+                elif opc == 0x0F and 0x90 <= modrm <= 0x9F and \
+                        lead + 2 < insn.size and insn.bytes[lead + 2] & 0x38:
+                    # setcc modrm reg is a sub-opcode; aliases reemit as /0
+                    inst['db_bytes'] = insn.bytes
+                elif opc == 0xDC and modrm >= 0xC0 and (modrm & 7) == 0:
+                    # fop st(0),st(0) has a D8/DC alias pair -- uasm
+                    # always picks D8
+                    inst['db_bytes'] = insn.bytes
+                elif opc == 0xCD and insn.bytes[-1] == 3:
+                    # `int 3` reencodes as the CC single-byte form
+                    inst['db_bytes'] = insn.bytes
+                elif opc in (0xC0, 0xC1) and insn.bytes[-1] == 1:
+                    # `shift x, 1` reencodes as the D0/D1 implicit-count form
+                    inst['db_bytes'] = insn.bytes
+                elif opc == 0x0F and modrm in (0x20, 0x21, 0x22, 0x23) and \
+                        lead + 2 < insn.size and insn.bytes[lead + 2] < 0xC0:
+                    # mov to/from cr/dr with a memory-form modrm --
+                    # capstone prints the reg form but uasm emits /C0
+                    inst['db_bytes'] = insn.bytes
             if 'db_bytes' not in inst and lead:
                 leadb = insn.bytes[:lead]
                 # a 66h/67h prefix only survives reassembly when the insn
@@ -1377,9 +1488,11 @@ class Analyzer:
                 if 0x66 in leadb and not (
                         mnem.split()[-1] in _DWORD_MNEMS or any(
                             o.type == X86_OP_REG and
-                            (insn.reg_name(o.reg) or '')[:1] == 'e' or
+                            (insn.reg_name(o.reg) or '') in _EREGS or
                             o.type == X86_OP_MEM and o.size in (4, 6)
-                            for o in ops)):
+                            for o in ops)) or \
+                        0x66 in leadb and \
+                        mnem.split()[-1] in _SYS_FIXED_MNEMS:
                     inst['db_bytes'] = insn.bytes
                 # a call/jmp through a 32-bit operand loses its 66h --
                 # uasm won't emit it for a control-flow instruction even
@@ -1401,6 +1514,14 @@ class Analyzer:
                     # override has no asm form
                     inst['db_bytes'] = insn.bytes
                 segb = [b for b in leadb if b in SEG_PREFIX]
+                if 'db_bytes' not in inst and segb and \
+                        any(b in (0x66, 0x67) for b in leadb) and \
+                        min(leadb.index(b) for b in segb) < min(
+                            leadb.index(b) for b in leadb
+                            if b in (0x66, 0x67)):
+                    # uasm emits 66h/67h before a seg override; an
+                    # original seg-first prefix order is not reproducible
+                    inst['db_bytes'] = insn.bytes
                 if 'db_bytes' not in inst and len(segb) == 1:
                     mems = [o.mem for o in ops if o.type == X86_OP_MEM]
                     if mems:
@@ -1415,10 +1536,19 @@ class Analyzer:
                         # seg prefix on a non-memory insn has no asm form
                         inst['db_bytes'] = insn.bytes
         bmnem = mnem.split()[-1]
+        pmnem = mnem.split()[0] if ' ' in mnem else ''
         if bmnem in _ASM_NO_MNEM or \
                 (bmnem in _ASM_FPU_SINGLE and len(ops) == 1 and
                  ops[0].type == X86_OP_REG) or \
                 (bmnem in ('aam', 'aad') and ops) or \
+                (pmnem == 'lock' and not (
+                    bmnem in _ASM_LOCKABLE and ops and
+                    ops[0].type == X86_OP_MEM)) or \
+                (pmnem in ('rep', 'repe', 'repz', 'repne', 'repnz') and
+                 bmnem not in _ASM_REPABLE) or \
+                pmnem == 'notrack' or \
+                (bmnem == 'nop' and ops) or \
+                set(insn.groups) & _ASM_BAD_GROUPS or \
                 any(o.type == X86_OP_REG and
                     insn.reg_name(o.reg)[:3] in ('xmm', 'ymm', 'zmm')
                     for o in ops):
@@ -1427,11 +1557,15 @@ class Analyzer:
             # keep the original bytes
             inst['db_bytes'] = insn.bytes
         if enc is not None and enc.imm_size == 2 and ops and \
-                ops[-1].type == X86_OP_IMM and insn.bytes and \
-                insn.bytes[0] in self._IMM16_OPT_OPS:
+                ops[-1].type == X86_OP_IMM and insn.bytes:
+            ld = 0
+            while ld < len(insn.bytes) and insn.bytes[ld] in _PREFIX_BYTES:
+                ld += 1
             iv = ops[-1].imm
             iv -= 0x10000 if iv >= 0x8000 else 0
-            if -128 <= iv <= 127:
+            if ld < len(insn.bytes) and \
+                    insn.bytes[ld] in self._IMM16_OPT_OPS and \
+                    -128 <= iv <= 127:
                 # uasm would shorten this imm16 form to the sign-extended
                 # imm8 encoding -- keep the original bytes
                 inst['db_bytes'] = insn.bytes
@@ -1531,6 +1665,16 @@ class Analyzer:
             atxt = inst.get('asm_ops') or ', '.join(parts)
             inst['asm_ops'] = re.sub(
                 r'(?:dword|qword|fword|word|byte) ptr ', '', atxt)
+        if 'db_bytes' not in inst and ops and \
+                X86_GRP_FPU in insn.groups and \
+                any(o.type == X86_OP_MEM for o in ops):
+            atxt = inst.get('asm_ops') or ', '.join(parts)
+            if 'ptr' not in atxt and not any(
+                    'ptr' in str(v)
+                    for v in inst.get('asm_ops_map', {}).values()):
+                # an FPU memory operand without a size keyword is
+                # ambiguous to uasm (fld [bx] -> A2183)
+                inst['db_bytes'] = insn.bytes
         return ', '.join(parts)
 
     # ---------------------------------------------------------------- main
@@ -1663,43 +1807,50 @@ class Analyzer:
                 self.auto_names[a] = self._unique(
                     nm or f"asc_{a:X}", a)
 
-        # render + store instructions
+        # render + store instructions -- bulk inserts in one transaction;
+        # db.execute() commits per call which turns 100k+ rows into an
+        # fsync-per-row bottleneck
+        conn = self.db.conn
+        rows = []
         for inst in self.instructions:
             inst['op_str'] = self.render(inst)
             dbh = inst.get('db_bytes')
-            self.db.execute(
-                "INSERT OR REPLACE INTO instructions (addr, size, mnem, op_str, asm_str, type, db_bytes) "
-                "VALUES (?, ?, ?, ?, ?, 'code', ?)",
+            rows.append(
                 (inst['addr'], inst['size'], inst['mnem'], inst['op_str'],
                  inst.get('asm_ops'), dbh.hex() if dbh else None))
+        conn.executemany(
+            "INSERT OR REPLACE INTO instructions (addr, size, mnem, op_str, asm_str, type, db_bytes) "
+            "VALUES (?, ?, ?, ?, ?, 'code', ?)", rows)
 
         # persist auto labels into symbols (auto=1, explicit wins)
-        for a, nm in self.auto_names.items():
-            if nm and a not in self.names:
-                kind = 'sub' if a in self.funcs else \
-                       'loc' if a in self.code_refs else 'data'
-                self.db.execute(
-                    "INSERT OR IGNORE INTO symbols (addr, name, auto, kind) VALUES (?, ?, 1, ?)",
-                    (a, nm, kind))
+        rows = [
+            (a, nm, 'sub' if a in self.funcs else
+             'loc' if a in self.code_refs else 'data')
+            for a, nm in self.auto_names.items()
+            if nm and a not in self.names]
+        conn.executemany(
+            "INSERT OR IGNORE INTO symbols (addr, name, auto, kind) "
+            "VALUES (?, ?, 1, ?)", rows)
         # code refs as loc labels
-        for a in self.code_refs:
-            if a not in self.names and a not in self.auto_names and a not in self.funcs:
-                self.db.execute(
-                    "INSERT OR IGNORE INTO symbols (addr, name, auto, kind) VALUES (?, ?, 1, 'loc')",
-                    (a, f"loc_{a:X}"))
+        rows = [(a, f"loc_{a:X}") for a in self.code_refs
+                if a not in self.names and a not in self.auto_names
+                and a not in self.funcs]
+        conn.executemany(
+            "INSERT OR IGNORE INTO symbols (addr, name, auto, kind) "
+            "VALUES (?, ?, 1, 'loc')", rows)
 
         if self.compute_xrefs:
-            for fr, to, typ in self.xrefs:
-                self.db.execute(
-                    "INSERT OR IGNORE INTO xrefs (from_addr, to_addr, type, instruction) "
-                    "VALUES (?, ?, ?, '')", (fr, to, typ))
+            conn.executemany(
+                "INSERT OR IGNORE INTO xrefs (from_addr, to_addr, type, instruction) "
+                "VALUES (?, ?, ?, '')", self.xrefs)
 
         # functions discovered during analysis get written back
-        for f, fv in self.funcs.items():
-            if fv.get('auto') and f not in self.names:
-                self.db.execute(
-                    "INSERT OR IGNORE INTO functions (start, end, name, flags) VALUES (?, ?, ?, 0)",
-                    (f, fv['end'], fv['name']))
+        rows = [(f, fv['end'], fv['name']) for f, fv in self.funcs.items()
+                if fv.get('auto') and f not in self.names]
+        conn.executemany(
+            "INSERT OR IGNORE INTO functions (start, end, name, flags) "
+            "VALUES (?, ?, ?, 0)", rows)
+        conn.commit()
 
         total_code = sum(i['size'] for i in self.instructions)
         coverage = total_code / max(len(self.binary), 1) * 100
