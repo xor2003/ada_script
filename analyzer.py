@@ -948,8 +948,9 @@ class Analyzer:
             atxt = np + (segname or '') + f"[{num}]"
         elif self.seg_of(target) is not None:
             tseg = self.seg_of(target)
+            tstart = max(tseg['start'], self.base)
             dmask = 0xFFFFFFFF if insn.prefix[3] == 0x67 else 0xFFFF
-            if (target - tseg['start']) & dmask != m.disp & dmask:
+            if (target - tstart) & dmask != m.disp & dmask:
                 # uasm would emit the label's offset in its own frame,
                 # which differs from the stored displacement -- numeric
                 num = inner + ('+' if m.disp >= 0 else '-') + \
@@ -1016,9 +1017,10 @@ class Analyzer:
                     inst['db_bytes'] = insn.bytes
                 elif self.seg_of(target) is not None:
                     tseg = self.seg_of(target)
+                    tstart = max(tseg['start'], self.base)
                     dmask = 0xFFFFFFFF if insn.prefix[3] == 0x67 \
                         else 0xFFFF
-                    if (target - tseg['start']) & dmask != \
+                    if (target - tstart) & dmask != \
                             m.disp & dmask:
                         # label's offset in its own frame differs from
                         # the stored displacement -- numeric

@@ -22,6 +22,8 @@ import hashlib
 import re
 import zlib
 
+from typing import ClassVar
+
 from utils import logger
 
 # IDA attribute flag bits -> "Attributes:" words
@@ -661,6 +663,11 @@ class OutputGenerator:
         cur_func = None
         prev_break = False   # previous insn was jmp/ret (non-fallthrough)
         addr = seg['start']
+        if asm and addr < self.db.image_base:
+            # segment frame extends below the image start (e.g. an IDC
+            # segment covering PSP space) -- those bytes are not in the
+            # file image; emitting them would shift the whole stream
+            addr = self.db.image_base
         last_addr = addr
 
         def close_func(at_addr):
@@ -792,10 +799,9 @@ class OutputGenerator:
                             last_addr = addr
                             addr += size
                             continue
-                if asm and not dbh and len(chunks) > 1 and \
-                        mnem in _NEAR_BRANCH:
-                    # a near branch across a chunk boundary cannot be
-                    # encoded -- emit the original bytes verbatim
+                if asm and not dbh and mnem in _NEAR_BRANCH:
+                    # a near branch across a chunk or segment boundary
+                    # cannot be encoded -- emit the original bytes verbatim
                     tgt = (aops or ops).split()[-1].rstrip(',')
                     ta = self._name2addr.get(tgt)
                     tseg = self.seg_of(ta) if ta is not None else None
@@ -1029,7 +1035,7 @@ class OutputGenerator:
     # --------------------------------------------------------------- asm
     # names uasm/MASM treat as reserved (regs, directives, mnemonics);
     # a label colliding with any of these must be renamed in the .asm
-    _ASM_RESERVED = {
+    _ASM_RESERVED: ClassVar[set] = {
         'ax', 'bx', 'cx', 'dx', 'si', 'di', 'bp', 'sp', 'ip',
         'al', 'ah', 'bl', 'bh', 'cl', 'ch', 'dl', 'dh',
         'cs', 'ds', 'es', 'ss', 'fs', 'gs',
